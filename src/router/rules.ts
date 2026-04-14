@@ -2,6 +2,7 @@ import type { RoutingConfig, ScoringResult, ScoringConfig, Tier } from "./types.
 
 type DimensionScore = { name: string; score: number; signal: string | null };
 
+// 按估算 token 数量给长度打分：短偏简单，长偏复杂。
 function scoreTokenCount(
   estimatedTokens: number,
   thresholds: { simple: number; complex: number },
@@ -23,6 +24,7 @@ function scoreKeywordMatch(
   thresholds: { low: number; high: number },
   scores: { none: number; low: number; high: number },
 ): DimensionScore {
+  // 统一用包含匹配，所有语种关键词都走同一套逻辑。
   const matches = keywords.filter((kw) => text.includes(kw.toLowerCase()));
   if (matches.length >= thresholds.high) {
     return {
@@ -42,6 +44,7 @@ function scoreKeywordMatch(
 }
 
 function scoreMultiStep(text: string): DimensionScore {
+  // 出现分步描述时，通常任务复杂度会更高。
   const patterns = [/first.*then/i, /step \d/i, /\d\.\s/];
   const hits = patterns.filter((p) => p.test(text));
   if (hits.length > 0) {
@@ -51,6 +54,7 @@ function scoreMultiStep(text: string): DimensionScore {
 }
 
 function scoreQuestionComplexity(prompt: string): DimensionScore {
+  // 问号越多，通常问题拆分越细，这里做一个轻量信号。
   const count = (prompt.match(/\?/g) || []).length;
   if (count > 3) {
     return { name: "questionComplexity", score: 0.5, signal: `${count} questions` };
@@ -72,6 +76,7 @@ function scoreAgenticTask(
     }
   }
 
+  // 按命中数量分段，避免单次命中把分数抬得太高。
   if (matchCount >= 4) {
     return {
       dimensionScore: { name: "agenticTask", score: 1.0, signal: `agentic (${signals.join(", ")})` },
@@ -107,7 +112,7 @@ export function classifyByRules(
   estimatedTokens: number,
   scoring: ScoringConfig,
 ): ScoringResult {
-  // 与主项目一致：仅用用户文本评分，避免系统提示词干扰。
+  // 只看用户输入做评分，避免 system prompt 干扰结果。
   const userText = prompt.toLowerCase();
   void systemPrompt;
 
@@ -212,6 +217,7 @@ export function classifyByRules(
   const signals = dimensions.filter((d) => d.signal !== null).map((d) => d.signal!);
   const weights = scoring.dimensionWeights;
   let weightedScore = 0;
+  // 各维度分数乘权重后累加，得到最终总分。
   for (const d of dimensions) {
     const w = weights[d.name] ?? 0;
     weightedScore += d.score * w;
@@ -219,6 +225,7 @@ export function classifyByRules(
 
   const reasoningHits = scoring.reasoningKeywords.filter((k) => userText.includes(k.toLowerCase()));
   if (reasoningHits.length >= 2) {
+    // 推理关键词命中明显时，直接判到 REASONING，并提高最低置信度。
     const confidence = calibrateConfidence(Math.max(weightedScore, 0.3), scoring.confidenceSteepness);
     return {
       score: weightedScore,
@@ -233,6 +240,7 @@ export function classifyByRules(
   let tier: Tier;
   let distanceFromBoundary: number;
   const { simpleMedium, mediumComplex, complexReasoning } = scoring.tierBoundaries;
+  // 记录与分档边界的距离，用来衡量当前档位稳不稳。
   if (weightedScore < simpleMedium) {
     tier = "SIMPLE";
     distanceFromBoundary = simpleMedium - weightedScore;
@@ -252,6 +260,7 @@ export function classifyByRules(
 
   const confidence = calibrateConfidence(distanceFromBoundary, scoring.confidenceSteepness);
   if (confidence < scoring.confidenceThreshold) {
+    // 置信度偏低时先返回空档位，再由上层做兜底。
     return { score: weightedScore, tier: null, confidence, signals, agenticScore, dimensions };
   }
   return { score: weightedScore, tier, confidence, signals, agenticScore, dimensions };
@@ -264,6 +273,7 @@ export function routeByRules(
   hasTools: boolean,
   config: RoutingConfig,
 ) {
+  // 用字符长度近似 token 数，成本低且对分层够用。
   const estimatedTokens = Math.ceil(`${systemPrompt ?? ""} ${prompt}`.length / 4);
   const result = classifyByRules(prompt, systemPrompt, estimatedTokens, config.scoring);
 
@@ -281,6 +291,7 @@ export function routeByRules(
   }
 
   if (systemPrompt && /json|structured|schema/i.test(systemPrompt)) {
+    // 如果要求结构化输出，必要时抬高最低档位。
     const rank: Record<Tier, number> = { SIMPLE: 0, MEDIUM: 1, COMPLEX: 2, REASONING: 3 };
     const minTier = config.overrides.structuredOutputMinTier;
     if (rank[tier] < rank[minTier]) {
@@ -289,7 +300,7 @@ export function routeByRules(
     }
   }
 
-  // OpenClaw tool calls typically need at least MEDIUM stability
+  // 工具调用通常至少需要 MEDIUM 档的稳定性。
   if (hasTools && tier === "SIMPLE") {
     tier = "MEDIUM";
     reasoning += " | upgraded to MEDIUM (tools)";
@@ -299,5 +310,6 @@ export function routeByRules(
 }
 
 function calibrateConfidence(distance: number, steepness: number): number {
+  // 用 Sigmoid 做映射：离边界越远，置信度越高。
   return 1 / (1 + Math.exp(-steepness * distance));
 }
