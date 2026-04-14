@@ -1,9 +1,11 @@
 import type { RoutingConfig } from "./types.js";
 
 export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
-  // 评分规则与主项目保持一致，但以复制形式独立维护。
+  // 这套评分参数沿用 ClawRouter 的思路。
   scoring: {
+    // 文本长度粗分档：短文本偏简单，长文本偏复杂。
     tokenCountThresholds: { simple: 50, complex: 500 },
+    // 关键词覆盖多语种，匹配时统一转小写做包含判断。
     codeKeywords: [
       "function",
       "class",
@@ -872,6 +874,7 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       "تصحيح",
       "تحقق",
     ],
+    // 各维度权重决定影响力，总和约等于 1。
     dimensionWeights: {
       tokenCount: 0.08,
       codePresence: 0.15,
@@ -889,6 +892,7 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
       domainSpecificity: 0.02,
       agenticTask: 0.04,
     },
+    // 分数落在哪个区间，就归到对应档位。
     tierBoundaries: {
       simpleMedium: 0.0,
       mediumComplex: 0.3,
@@ -898,7 +902,9 @@ export const DEFAULT_ROUTING_CONFIG: RoutingConfig = {
     confidenceThreshold: 0.7,
   },
   overrides: {
+    // 置信度不够时统一回到该档，避免来回跳档。
     ambiguousDefaultTier: "MEDIUM",
+    // 需要结构化输出时，最低不低于这个档位。
     structuredOutputMinTier: "MEDIUM",
   },
 };

@@ -5,6 +5,7 @@ import { routeByRules } from "./router/rules.js";
 import type { Tier } from "./router/types.js";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
+// 只保留短时间内的请求指纹，用来拦截重复请求。
 const recentRequests = new Map<string, number>();
 
 type ChatMessage = { role?: string; content?: unknown };
@@ -37,6 +38,7 @@ function isDuplicateWithinWindow(requestHash: string): boolean {
 }
 
 function cleanOpenClawUserText(text: string): string {
+  // 去掉 OpenClaw 附带的元信息，尽量保留用户原始问题。
   return text
     .split("\n")
     .map((line) => line.trim())
@@ -54,6 +56,7 @@ function normalizeContentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return "";
   return (content as Array<{ type?: string; text?: string }>)
+    // 只取文本块，其他类型内容不参与路由文本拼接。
     .filter((b) => {
       if (typeof b?.text !== "string" || b.text.length === 0) return false;
       const t = String(b.type ?? "").toLowerCase();
@@ -72,6 +75,7 @@ function extractPromptAndSystem(messages: ChatMessage[]) {
 }
 
 function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
+  // 转发给上游前也做同样清洗，避免路由输入和实际输入不一致。
   return messages.map((m) => {
     if (m.role !== "user") return m;
     if (typeof m.content === "string") return { ...m, content: cleanOpenClawUserText(m.content) };
@@ -86,12 +90,14 @@ function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function maxOutputTokens(body: Record<string, unknown>): number {
+  // 给输出 token 统一加上限，防止异常参数压垮上游。
   const mt = body.max_tokens ?? body.max_completion_tokens;
   if (typeof mt === "number" && mt > 0) return Math.min(mt, 128_000);
   return 4096;
 }
 
 function tierTarget(tier: Tier): { baseUrl: string; model: string } {
+  // 先读当前档位配置，没配再回退到默认配置。
   const defBase = (process.env.VLLM_DEFAULT_BASE ?? "").replace(/\/$/, "");
   const defModel = process.env.VLLM_DEFAULT_MODEL ?? "default";
   const envBase = (process.env[`VLLM_${tier}_BASE`] ?? "").replace(/\/$/, "");
@@ -102,6 +108,7 @@ function tierTarget(tier: Tier): { baseUrl: string; model: string } {
 }
 
 function authorizationForTier(tier: Tier, req: IncomingMessage): string | undefined {
+  // 非 SIMPLE 档可回退默认密钥；SIMPLE 优先沿用请求头凭据。
   const tierKey = process.env[`VLLM_${tier}_API_KEY`]?.trim();
   if (tierKey) return tierKey.startsWith("Bearer ") ? tierKey : `Bearer ${tierKey}`;
   if (tier !== "SIMPLE") {
@@ -143,6 +150,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   const { prompt, systemPrompt } = extractPromptAndSystem(messages);
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const maxTokens = maxOutputTokens(body);
+  // 路由层统一产出分档结果，转发层只按结果执行。
   const routed = routeByRules(prompt, systemPrompt, maxTokens, hasTools, DEFAULT_ROUTING_CONFIG);
 
   const promptLog = prompt.replace(/\s+/g, " ").trim();
@@ -153,6 +161,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   const dryRun = isGatewayDryRun();
   const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routed.tier);
   if (dryRun) {
+    // dry-run 只返回路由结果，不访问上游服务。
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
@@ -194,6 +203,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     const decoder = new TextDecoder();
     let sseBuffer = "";
     let fullContent = "";
+    // 聚合流式内容，结束时可以打完整日志。
     const toolCalls: Array<{ id?: string; name?: string; arguments?: string }> = [];
     for (;;) {
       const { done, value } = await reader.read();
