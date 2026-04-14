@@ -1,12 +1,23 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
-import { DEFAULT_ROUTING_CONFIG } from "./router/config.js";
-import { routeByRules } from "./router/rules.js";
-import type { Tier } from "./router/types.js";
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import { BLOCKRUN_MODELS, DEFAULT_ROUTING_CONFIG, route } from "@blockrun/clawrouter";
+
+type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
+const REQUEST_LOG_FILE = resolve(process.env.GATEWAY_REQUEST_LOG_FILE ?? "./logs/gateway-requests.json");
+const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
 // 只保留短时间内的请求指纹，用来拦截重复请求。
 const recentRequests = new Map<string, number>();
+let requestLogWriteQueue: Promise<void> = Promise.resolve();
+const modelPricing = new Map(
+  BLOCKRUN_MODELS.map((model) => [
+    model.id,
+    { inputPrice: model.inputPrice, outputPrice: model.outputPrice },
+  ]),
+);
 
 type ChatMessage = { role?: string; content?: unknown };
 
@@ -54,7 +65,7 @@ function cleanOpenClawUserText(text: string): string {
 
 function normalizeContentToText(content: unknown): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
+  if (!Array.isArray(content)) return content == null ? "" : String(content);
   return (content as Array<{ type?: string; text?: string }>)
     // 只取文本块，其他类型内容不参与路由文本拼接。
     .filter((b) => {
@@ -69,8 +80,11 @@ function normalizeContentToText(content: unknown): string {
 function extractPromptAndSystem(messages: ChatMessage[]) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const prompt = cleanOpenClawUserText(normalizeContentToText(lastUser?.content));
-  const system = messages.find((m) => m.role === "system");
-  const systemPrompt = normalizeContentToText(system?.content) || undefined;
+  const systemPrompt = messages
+    .filter((m) => m.role === "system")
+    .map((m) => normalizeContentToText(m.content))
+    .filter((text) => text.length > 0)
+    .join("\n\n");
   return { prompt, systemPrompt };
 }
 
@@ -90,10 +104,19 @@ function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function maxOutputTokens(body: Record<string, unknown>): number {
-  // 给输出 token 统一加上限，防止异常参数压垮上游。
-  const mt = body.max_tokens ?? body.max_completion_tokens;
-  if (typeof mt === "number" && mt > 0) return Math.min(mt, 128_000);
-  return 4096;
+  // 保持与 router 输入字段一致：优先 max_completion_tokens，再回退 max_tokens。
+  const mt = body.max_completion_tokens ?? body.max_tokens;
+  if (typeof mt === "number" && mt > 0) return mt;
+  return 1024;
+}
+
+function isTier(value: unknown): value is Tier {
+  return typeof value === "string" && VALID_TIERS.includes(value as Tier);
+}
+
+function defaultTier(): Tier {
+  const envTier = String(process.env.VLLM_DEFAULT_TIER ?? "MEDIUM").toUpperCase();
+  return isTier(envTier) ? envTier : "MEDIUM";
 }
 
 function tierTarget(tier: Tier): { baseUrl: string; model: string } {
@@ -127,6 +150,37 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+function tryParseJson(rawBody: string): unknown {
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return undefined;
+  }
+}
+
+function queueRequestLogWrite(req: IncomingMessage, rawBody: string): void {
+  const requestSnapshot = {
+    timestamp: new Date().toISOString(),
+    method: req.method ?? "",
+    url: req.url ?? "",
+    httpVersion: req.httpVersion,
+    remoteAddress: req.socket.remoteAddress ?? "",
+    headers: req.headers,
+    rawBody,
+    parsedBody: tryParseJson(rawBody),
+  };
+  const serialized = `${JSON.stringify(requestSnapshot)}\n`;
+
+  requestLogWriteQueue = requestLogWriteQueue
+    .then(async () => {
+      await mkdir(dirname(REQUEST_LOG_FILE), { recursive: true });
+      await appendFile(REQUEST_LOG_FILE, serialized, "utf8");
+    })
+    .catch((error) => {
+      console.error("[gateway] request_log_write_failed", error);
+    });
+}
+
 async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: string): Promise<void> {
   const hash = hashRequest(rawBody);
   const caller = inferCaller(req);
@@ -148,18 +202,22 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
   const { prompt, systemPrompt } = extractPromptAndSystem(messages);
-  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const maxTokens = maxOutputTokens(body);
-  // 路由层统一产出分档结果，转发层只按结果执行。
-  const routed = routeByRules(prompt, systemPrompt, maxTokens, hasTools, DEFAULT_ROUTING_CONFIG);
+  const decision = route(prompt, systemPrompt || undefined, maxTokens, {
+    config: DEFAULT_ROUTING_CONFIG,
+    modelPricing,
+  });
+  const routedTier = isTier(decision.tier) ? decision.tier : defaultTier();
+  const routedConfidence = typeof decision.confidence === "number" ? decision.confidence : 0.5;
+  const routedReasoning = JSON.stringify(decision.reasoning);
 
   const promptLog = prompt.replace(/\s+/g, " ").trim();
   console.log(
-    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} score=${routed.rule.score.toFixed(3)} raw_tier=${routed.rule.tier ?? "AMBIGUOUS"} final_tier=${routed.tier} confidence=${routed.confidence.toFixed(3)} signals=${JSON.stringify(routed.rule.signals.join(" | "))} reason=${JSON.stringify(routed.reasoning)}`,
+    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} final_tier=${routedTier} confidence=${routedConfidence.toFixed(3)} reason=${routedReasoning}`,
   );
 
   const dryRun = isGatewayDryRun();
-  const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routed.tier);
+  const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routedTier);
   if (dryRun) {
     // dry-run 只返回路由结果，不访问上游服务。
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -167,9 +225,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       JSON.stringify({
         object: "chat.completion",
         dry_run: true,
-        tier: routed.tier,
-        confidence: routed.confidence,
-        reasoning: routed.reasoning,
+        tier: routedTier,
+        confidence: routedConfidence,
+        reasoning: decision.reasoning,
         upstream: target,
       }),
     );
@@ -178,7 +236,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const stream = body.stream === true;
   console.log(
-    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routed.tier} target=${target.model} base=${target.baseUrl} stream=${stream}`,
+    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} target=${target.model} base=${target.baseUrl} stream=${stream}`,
   );
 
   const forwardBody = {
@@ -186,7 +244,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     ...(Array.isArray(body.messages) ? { messages: sanitizeMessagesForUpstream(messages) } : {}),
     model: target.model,
   };
-  const auth = authorizationForTier(routed.tier, req);
+  const auth = authorizationForTier(routedTier, req);
   const upstream = await fetch(`${target.baseUrl}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
@@ -247,7 +305,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     }
     res.end();
     console.log(
-      `[gateway] upstream_done caller=${caller} tier=${routed.tier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
+      `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
     );
     return;
   }
@@ -256,7 +314,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
   console.log(
-    `[gateway] upstream_done caller=${caller} tier=${routed.tier} model=${target.model} status=${upstream.status} body=${JSON.stringify(text)}`,
+    `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} body=${JSON.stringify(text)}`,
   );
 }
 
@@ -269,6 +327,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
       const raw = await readBody(req);
+      queueRequestLogWrite(req, raw);
       await handleChat(req, res, raw);
       return;
     }
