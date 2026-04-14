@@ -17,5 +17,8 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dependencies": {
+    "@blockrun/clawrouter": "^0.12.149"
   }
 }
