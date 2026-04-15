@@ -6,8 +6,18 @@ import {
   BLOCKRUN_MODELS,
   DEFAULT_ROUTING_CONFIG,
   route,
+  type RoutingConfig,
   type RoutingDecision,
 } from "@blockrun/clawrouter";
+
+/** 覆盖 @blockrun/clawrouter 默认的 scoring.confidenceThreshold（包内约 0.7）。 */
+const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
+  ...DEFAULT_ROUTING_CONFIG,
+  scoring: {
+    ...DEFAULT_ROUTING_CONFIG.scoring,
+    confidenceThreshold:0.55,
+  },
+};
 
 type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
@@ -43,7 +53,7 @@ function collectReasoningKeywordMatches(prompt: string, keywords: readonly strin
 
 /** 仅按加权分与 tierBoundaries 映射档位（不含「≥2 推理词」等覆盖规则）。 */
 function tierFromWeightedScoreOnly(score: number): Tier {
-  const { simpleMedium, mediumComplex, complexReasoning } = DEFAULT_ROUTING_CONFIG.scoring.tierBoundaries;
+  const { simpleMedium, mediumComplex, complexReasoning } = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
   if (score < simpleMedium) return "SIMPLE";
   if (score < mediumComplex) return "MEDIUM";
   if (score < complexReasoning) return "COMPLEX";
@@ -68,9 +78,9 @@ function buildScoringDetailLog(params: {
   const { decision, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens } = params;
   const reasoning = decision.reasoning;
   const weightedScore = parseWeightedScoreFromReasoning(reasoning);
-  const boundaries = DEFAULT_ROUTING_CONFIG.scoring.tierBoundaries;
-  const overrides = DEFAULT_ROUTING_CONFIG.overrides;
-  const reasoningKw = collectReasoningKeywordMatches(prompt, DEFAULT_ROUTING_CONFIG.scoring.reasoningKeywords);
+  const boundaries = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
+  const overrides = GATEWAY_ROUTING_CONFIG.overrides;
+  const reasoningKw = collectReasoningKeywordMatches(prompt, GATEWAY_ROUTING_CONFIG.scoring.reasoningKeywords);
   const estimatedTokens = estimateRouterInputTokens(prompt, systemPrompt);
   const forcedComplexByTokens = estimatedTokens > overrides.maxTokensForceComplex;
   const ambiguousBranch = reasoning.includes("ambiguous ->");
@@ -97,7 +107,7 @@ function buildScoringDetailLog(params: {
   }
   if (ambiguousBranch) {
     explanations.push(
-      `规则置信度低于 confidenceThreshold=${DEFAULT_ROUTING_CONFIG.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
+      `规则置信度低于 confidenceThreshold=${GATEWAY_ROUTING_CONFIG.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
     );
   }
   if (weightedScore !== undefined && scoreOnlyTier !== undefined) {
@@ -345,7 +355,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   const { prompt, systemPrompt } = extractPromptAndSystem(messages);
   const maxTokens = maxOutputTokens(body);
   const decision = route(prompt, systemPrompt || undefined, maxTokens, {
-    config: DEFAULT_ROUTING_CONFIG,
+    config: GATEWAY_ROUTING_CONFIG,
     modelPricing,
   });
   const routedTier = isTier(decision.tier) ? decision.tier : defaultTier();
