@@ -2,13 +2,154 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import { BLOCKRUN_MODELS, DEFAULT_ROUTING_CONFIG, route } from "@blockrun/clawrouter";
+import {
+  BLOCKRUN_MODELS,
+  DEFAULT_ROUTING_CONFIG,
+  route,
+  type RoutingDecision,
+} from "@blockrun/clawrouter";
 
 type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
 const REQUEST_LOG_FILE = resolve(process.env.GATEWAY_REQUEST_LOG_FILE ?? "./logs/gateway-requests.json");
 const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+
+const SCORING_LOG_PROMPT_MAX = 480;
+
+function truncateForLog(text: string, maxChars: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= maxChars) return t;
+  return `${t.slice(0, maxChars)}…(共 ${t.length} 字)`;
+}
+
+function formatReasoningForLog(reasoning: string): string {
+  return reasoning.length > 4000 ? `${reasoning.slice(0, 4000)}…(已截断)` : reasoning;
+}
+
+/** 与 clawrouter 规则路由一致：从 reasoning 前缀解析加权分。 */
+function parseWeightedScoreFromReasoning(reasoning: string): number | undefined {
+  const m = reasoning.match(/^score=(-?\d+(?:\.\d+)?)/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** 与 classifyByRules 一致：仅对用户 prompt 小写文本匹配推理关键词。 */
+function collectReasoningKeywordMatches(prompt: string, keywords: readonly string[]): string[] {
+  const userText = prompt.toLowerCase();
+  return keywords.filter((kw) => userText.includes(kw.toLowerCase()));
+}
+
+/** 仅按加权分与 tierBoundaries 映射档位（不含「≥2 推理词」等覆盖规则）。 */
+function tierFromWeightedScoreOnly(score: number): Tier {
+  const { simpleMedium, mediumComplex, complexReasoning } = DEFAULT_ROUTING_CONFIG.scoring.tierBoundaries;
+  if (score < simpleMedium) return "SIMPLE";
+  if (score < mediumComplex) return "MEDIUM";
+  if (score < complexReasoning) return "COMPLEX";
+  return "REASONING";
+}
+
+function estimateRouterInputTokens(prompt: string, systemPrompt: string): number {
+  const fullText = `${systemPrompt ?? ""} ${prompt}`;
+  return Math.ceil(fullText.length / 4);
+}
+
+function buildScoringDetailLog(params: {
+  caller: string;
+  promptPreview: string;
+  prompt: string;
+  systemPrompt: string;
+  maxOutputTokens: number;
+  decision: RoutingDecision;
+  routedTier: Tier;
+  usedDefaultTier: boolean;
+}): Record<string, unknown> {
+  const { decision, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens } = params;
+  const reasoning = decision.reasoning;
+  const weightedScore = parseWeightedScoreFromReasoning(reasoning);
+  const boundaries = DEFAULT_ROUTING_CONFIG.scoring.tierBoundaries;
+  const overrides = DEFAULT_ROUTING_CONFIG.overrides;
+  const reasoningKw = collectReasoningKeywordMatches(prompt, DEFAULT_ROUTING_CONFIG.scoring.reasoningKeywords);
+  const estimatedTokens = estimateRouterInputTokens(prompt, systemPrompt);
+  const forcedComplexByTokens = estimatedTokens > overrides.maxTokensForceComplex;
+  const ambiguousBranch = reasoning.includes("ambiguous ->");
+  const structuredUpgrade = reasoning.includes("upgraded to") && reasoning.includes("structured output");
+  const hasStructuredSystemHint = /json|structured|schema/i.test(systemPrompt);
+  const scoreOnlyTier = weightedScore !== undefined ? tierFromWeightedScoreOnly(weightedScore) : undefined;
+  const reasoningKeywordTierBoost = reasoningKw.length >= 2;
+
+  const explanations: string[] = [];
+  if (usedDefaultTier) {
+    explanations.push(
+      `网关将路由层返回的档位「${String(decision.tier ?? "undefined")}」视为无效，已回退为环境变量 VLLM_DEFAULT_TIER（当前生效：${routedTier}）。`,
+    );
+  }
+  if (forcedComplexByTokens) {
+    explanations.push(
+      `估算输入约 ${estimatedTokens} tokens（超过 maxTokensForceComplex=${overrides.maxTokensForceComplex}），与 @blockrun/clawrouter 一致：强制 COMPLEX。`,
+    );
+  }
+  if (!forcedComplexByTokens && reasoningKeywordTierBoost && decision.tier === "REASONING") {
+    explanations.push(
+      `命中 ${reasoningKw.length} 个推理类关键词（≥2 即强制 REASONING），可覆盖仅凭分数轴得到的档位；若加权分仍低于 complexReasoning(${boundaries.complexReasoning})，属于预期行为。`,
+    );
+  }
+  if (ambiguousBranch) {
+    explanations.push(
+      `规则置信度低于 confidenceThreshold=${DEFAULT_ROUTING_CONFIG.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
+    );
+  }
+  if (weightedScore !== undefined && scoreOnlyTier !== undefined) {
+    explanations.push(
+      `加权分 ${weightedScore.toFixed(3)} 与阈值 simpleMedium=${boundaries.simpleMedium}、mediumComplex=${boundaries.mediumComplex}、complexReasoning=${boundaries.complexReasoning} 对比 → 纯分数轴为 ${scoreOnlyTier}；clawrouter 最终 tier=${decision.tier}。`,
+    );
+    if (decision.tier !== scoreOnlyTier && !reasoningKeywordTierBoost && !ambiguousBranch && !forcedComplexByTokens) {
+      explanations.push("若档位与分数轴不一致，请核对 reasoning 后缀（例如 structured output 升档）。");
+    }
+  }
+  if (structuredUpgrade) {
+    explanations.push("已触发 structured output 升档（reasoning 中含 upgraded … structured output）。");
+  } else if (hasStructuredSystemHint) {
+    explanations.push(
+      `系统提示含 json/structured/schema 线索；未出现升档说明当前 tier 已不低于 structuredOutputMinTier=${overrides.structuredOutputMinTier}。`,
+    );
+  }
+
+  return {
+    caller: params.caller,
+    prompt_preview: params.promptPreview,
+    estimated_input_tokens: estimatedTokens,
+    max_output_tokens: maxOutputTokens,
+    tier_boundaries: boundaries,
+    weighted_score: weightedScore ?? null,
+    tier_from_weighted_score_only: scoreOnlyTier ?? null,
+    reasoning_keyword_hits: reasoningKw.length,
+    reasoning_keywords_matched: reasoningKw.slice(0, 30),
+    routing: {
+      raw_tier: decision.tier,
+      final_tier: routedTier,
+      gateway_normalized_tier: usedDefaultTier,
+      confidence: decision.confidence,
+      method: decision.method,
+      profile: decision.profile ?? null,
+      model: decision.model,
+      agentic_score: decision.agenticScore ?? null,
+      cost_estimate: decision.costEstimate,
+      baseline_cost: decision.baselineCost,
+      savings: decision.savings,
+    },
+    flags: {
+      forced_complex_large_context: forcedComplexByTokens,
+      reasoning_keywords_force_reasoning: reasoningKeywordTierBoost,
+      ambiguous_low_confidence: ambiguousBranch,
+      structured_output_upgrade: structuredUpgrade,
+      system_has_structured_hint: hasStructuredSystemHint,
+    },
+    explanations_zh: explanations,
+    reasoning_full: formatReasoningForLog(reasoning),
+  };
+}
 // 只保留短时间内的请求指纹，用来拦截重复请求。
 const recentRequests = new Map<string, number>();
 let requestLogWriteQueue: Promise<void> = Promise.resolve();
@@ -208,13 +349,25 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     modelPricing,
   });
   const routedTier = isTier(decision.tier) ? decision.tier : defaultTier();
+  const usedDefaultTier = !isTier(decision.tier);
   const routedConfidence = typeof decision.confidence === "number" ? decision.confidence : 0.5;
-  const routedReasoning = JSON.stringify(decision.reasoning);
+  const reasoningOneLine = formatReasoningForLog(decision.reasoning).replace(/\s+/g, " ").trim();
 
   const promptLog = prompt.replace(/\s+/g, " ").trim();
   console.log(
-    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} final_tier=${routedTier} confidence=${routedConfidence.toFixed(3)} reason=${routedReasoning}`,
+    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} final_tier=${routedTier} confidence=${routedConfidence.toFixed(3)} reason=${JSON.stringify(reasoningOneLine)}`,
   );
+  const scoringDetail = buildScoringDetailLog({
+    caller,
+    promptPreview: truncateForLog(promptLog, SCORING_LOG_PROMPT_MAX),
+    prompt,
+    systemPrompt,
+    maxOutputTokens: maxTokens,
+    decision,
+    routedTier,
+    usedDefaultTier,
+  });
+  console.log("[gateway] scoring_detail", JSON.stringify(scoringDetail, null, 2));
 
   const dryRun = isGatewayDryRun();
   const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routedTier);
