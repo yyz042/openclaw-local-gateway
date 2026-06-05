@@ -8,6 +8,7 @@
 - **OpenClaw 友好输入处理**：在路由与转发前清洗 OpenClaw 元信息，避免“路由输入”和“真实上游输入”不一致。
 - **可运维可解释**：完整记录 tier、confidence、weighted score 推理依据，以及流式内容和 tool-call 片段。
 - **本地使用优化**：短时间窗口内拦截重复请求，减少误触发重复执行。
+- **会话级智能路由**：多轮对话固定档位、复杂任务升档、相似请求三次升档，简单追问可走轻量模型且不降级会话记忆。
 - **回退策略完善**：支持按 tier 的 endpoint/model/api-key 映射，并具备默认回退机制。
 
 ## ClawRouter routing 思想
@@ -32,21 +33,51 @@
    - 在网关里将 `scoring.confidenceThreshold` 覆盖为 `0.55`。
    - 保持与 `DEFAULT_ROUTING_CONFIG` 及其 scoring/override 思路兼容。
 
+## 会话级智能路由
+
+ClawRouter 对**最后一条 user 消息**给出 `proposed_tier` 后，网关再按**内存会话**（每个 HTTP 请求一轮，单次请求内的多条 message 不拆轮）做决策：
+
+1. **会话 ID**：优先 `x-session-id` / `x-clawrouter-session-id`；否则用请求中**首条** user 消息内容哈希。
+2. **档位固定（session-pinned）**：新分档不高于会话已记住的档位时，沿用会话档位（`proposed_tier` 为 `SIMPLE` 时走第 4 条）。
+3. **会话升档（session-upgrade）**：新分档更高时升档并更新会话记忆。
+4. **SIMPLE 追问（simple-follow-up）**：本次路由为 `SIMPLE` 但会话记忆更高档时，本次走 SIMPLE，**不降低**会话记忆档位。
+5. **三次升档（three-strike-escalation）**：同会话内相同 prompt 指纹（最后 user 文本 + 最近 assistant 的 tool 名）累计 3 次，再升一档。
+
+状态仅驻留内存，超过 `GATEWAY_SESSION_TTL_MS`（默认 30 分钟）过期。`route()` 仍只看**最后一条 user**，不会把整段 `messages` 历史拼进分档器。
+
+**可观测字段**：dry-run JSON 的 `proposed_tier` / `tier` / `route_reason` / `session_id`；响应头 `x-route-tier`、`x-route-reason`、`x-route-session-id`；日志 `scoring_detail.session` 与 `explanations_zh`。
+
+**dry-run 快速验证**（建议 `GATEWAY_DRY_RUN=1`、`GATEWAY_DEDUP_WINDOW_MS=0`）：
+
+```bash
+SESSION=demo-1
+BASE=http://127.0.0.1:38080/v1/chat/completions
+
+curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"请用形式化方法证明分布式共识算法的安全性，并给出完整推导。"}]}'
+
+curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"刚才第一步再解释一下"}]}'
+```
+
+第二轮常见 `route_reason=simple-follow-up`（`proposed_tier=SIMPLE`、会话仍记住更高档）。
+
 ## 明确移除的部分
 
 - x402 支付
 - 钱包/鉴权生命周期
 - 合作方与 provider 插件体系
-- 会话持久化
+- 持久化会话库 / session journal（仅保留轻量内存会话路由）
 
 ## 请求处理流程
 
 1. 通过 `POST /v1/chat/completions` 接收 OpenAI 兼容请求。
 2. 清洗 OpenClaw 用户文本（如 `[message_id: ...]`、时间戳包装）。
-3. 通过 ClawRouter 路由逻辑得出 `SIMPLE/MEDIUM/COMPLEX/REASONING`。
-4. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
-5. 转发并透传响应（保留 SSE 与 tool-call 数据）。
-6. 输出请求、路由、上游完成日志。
+3. 对最后一条 user 消息用 ClawRouter 得出 `proposed_tier`。
+4. 应用会话级规则（固定、升档、SIMPLE 追问、三次升档）。
+5. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
+6. 转发并透传响应（保留 SSE 与 tool-call 数据）。
+7. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
 
 ## 快速启动
 
@@ -66,6 +97,7 @@ OpenClaw provider 的 `baseUrl` 设置为：
 - `GATEWAY_PORT`：网关端口（默认 `38080`）
 - `GATEWAY_DRY_RUN`：`1/true` 时仅返回路由结果，不请求上游
 - `GATEWAY_DEDUP_WINDOW_MS`：重复请求拦截时间窗口
+- `GATEWAY_SESSION_TTL_MS`：内存会话路由 TTL（默认 `1800000`，30 分钟）
 - `VLLM_SIMPLE_BASE` / `VLLM_SIMPLE_MODEL`：SIMPLE 档目标
 - `VLLM_DEFAULT_BASE` / `VLLM_DEFAULT_MODEL` / `VLLM_DEFAULT_API_KEY`：非 SIMPLE 档默认回退目标与鉴权（若未配置档位专用项）
 
