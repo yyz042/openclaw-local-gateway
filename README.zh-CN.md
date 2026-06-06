@@ -9,6 +9,7 @@
 - **可运维可解释**：完整记录 tier、confidence、weighted score 推理依据，以及流式内容和 tool-call 片段。
 - **本地使用优化**：短时间窗口内拦截重复请求，减少误触发重复执行。
 - **会话级智能路由**：多轮对话固定档位、复杂任务升档、相似请求三次升档，简单追问可走轻量模型且不降级会话记忆。
+- **长上下文治理**：超长消息列表截断（保留 system/developer + 最近对话）、大请求压缩（去重重复消息、压缩 JSON 文本）。
 - **回退策略完善**：支持按 tier 的 endpoint/model/api-key 映射，并具备默认回退机制。
 
 ## ClawRouter routing 思想
@@ -62,6 +63,19 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 
 第二轮常见 `route_reason=simple-follow-up`（`proposed_tier=SIMPLE`、会话仍记住更高档）。
 
+## 长上下文治理
+
+转发上游前，网关会对 `messages` 做两步治理（逻辑与 `example-router` 一致）：
+
+1. **截断**：超过 `GATEWAY_MAX_MESSAGES`（默认 60）时，保留全部 `system` / `developer`，对话区只保留最近若干条。
+2. **压缩**（按需）：整包体积超过 `GATEWAY_COMPRESSION_THRESHOLD_KB`（默认 180 KB），或消息总字符数 > 5000 时：
+   - 跳过重复的长消息（同 role + 内容哈希，且单条 > 200 字）；
+   - 对 string 型 JSON 文本做 minify。
+
+治理在 OpenClaw 文本清洗之后、路由分档之前执行，确保路由与上游输入一致。
+
+**可观测字段**：响应头 `x-route-messages-truncated`、`x-route-messages-compressed`；日志 `[gateway] context_governance …`；dry-run JSON 的 `context_governance`。
+
 ## 明确移除的部分
 
 - x402 支付
@@ -73,11 +87,12 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 
 1. 通过 `POST /v1/chat/completions` 接收 OpenAI 兼容请求。
 2. 清洗 OpenClaw 用户文本（如 `[message_id: ...]`、时间戳包装）。
-3. 对最后一条 user 消息用 ClawRouter 得出 `proposed_tier`。
-4. 应用会话级规则（固定、升档、SIMPLE 追问、三次升档）。
-5. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
-6. 转发并透传响应（保留 SSE 与 tool-call 数据）。
-7. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
+3. 长上下文治理：截断超长消息列表、按需压缩大请求。
+4. 对最后一条 user 消息用 ClawRouter 得出 `proposed_tier`。
+5. 应用会话级规则（固定、升档、SIMPLE 追问、三次升档）。
+6. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
+7. 转发并透传响应（保留 SSE 与 tool-call 数据）。
+8. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
 
 ## 快速启动
 
@@ -98,6 +113,8 @@ OpenClaw provider 的 `baseUrl` 设置为：
 - `GATEWAY_DRY_RUN`：`1/true` 时仅返回路由结果，不请求上游
 - `GATEWAY_DEDUP_WINDOW_MS`：重复请求拦截时间窗口
 - `GATEWAY_SESSION_TTL_MS`：内存会话路由 TTL（默认 `1800000`，30 分钟）
+- `GATEWAY_MAX_MESSAGES`：消息列表上限；保留全部 system/developer，对话区只保留最近 N 条（默认 `60`）
+- `GATEWAY_COMPRESSION_THRESHOLD_KB`：请求体超过此大小（KB）时触发消息压缩（默认 `180`）
 - `VLLM_SIMPLE_BASE` / `VLLM_SIMPLE_MODEL`：SIMPLE 档目标
 - `VLLM_DEFAULT_BASE` / `VLLM_DEFAULT_MODEL` / `VLLM_DEFAULT_API_KEY`：非 SIMPLE 档默认回退目标与鉴权（若未配置档位专用项）
 
