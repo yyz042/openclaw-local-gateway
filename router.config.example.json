@@ -41,6 +41,11 @@
       "baseUrl": "https://api.groq.com/openai/v1",
       "model": "qwen/qwen3-32b",
       "apiKey": "",
+      "requestParams": {
+        "chat_template_kwargs": {
+          "enable_thinking": false
+        }
+      },
       "inputPrice": 0.1,
       "outputPrice": 0.3
     },
@@ -48,6 +53,7 @@
       "baseUrl": "https://api.us-west-2.modal.direct/v1",
       "model": "zai-org/GLM-5.1-FP8",
       "apiKey": "",
+      "removeParams": ["reasoning_effort"],
       "inputPrice": 0.6,
       "outputPrice": 1.8
     }
