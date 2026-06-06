@@ -8,7 +8,7 @@
     "dev": "tsx src/server.ts",
     "start": "node --import tsx src/server.ts",
     "start:env": "node --import tsx --env-file=.env src/server.ts",
-    "test:vllm-simple": "node --import tsx --env-file=.env scripts/test-vllm-simple-connectivity.ts"
+    "test:vllm-simple": "node --import tsx scripts/test-vllm-simple-connectivity.ts"
   },
   "devDependencies": {
     "@types/node": "^22.15.2",

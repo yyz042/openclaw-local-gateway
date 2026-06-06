@@ -11,7 +11,8 @@
 - **会话级智能路由**：多轮对话固定档位、复杂任务升档、相似请求三次升档，简单追问可走轻量模型且不降级会话记忆。
 - **长上下文治理**：超长消息列表截断（保留 system/developer + 最近对话）、大请求压缩（去重重复消息、压缩 JSON 文本）。
 - **轻量会话记忆**：识别「总结/回顾/进展」类 prompt 注入 session journal；从 assistant 回复提取关键动作并记录。
-- **回退策略完善**：支持按 tier 的 endpoint/model/api-key 映射，并具备默认回退机制。
+- **JSON 配置驱动**：`router.config.json` 统一管理 tier→backend、fallback 链、关键词、阈值、后端 URL/模型/API Key；支持 `POST /reload` 热重载。
+- **回退策略完善**：支持按 tier 的 primary + fallback 链，上游失败时按 `retryStatuses` 自动切换后端。
 
 ## ClawRouter routing 思想
 
@@ -102,16 +103,38 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 4. 对最后一条 user 消息用 ClawRouter 得出 `proposed_tier`。
 5. 应用会话级规则（固定、升档、SIMPLE 追问、三次升档）。
 6. 按需注入 session journal（总结/回顾类 prompt）。
-7. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
+7. 解析上游目标（`router.config.json` 的 `routing.tiers` + `backends`）。
 8. 转发并透传响应（保留 SSE 与 tool-call 数据）；成功后从 assistant 回复提取关键动作写入 journal。
 9. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
+
+## JSON 配置驱动
+
+复制示例配置并按需填写后端密钥：
+
+```bash
+cp router.config.example.json router.config.json
+```
+
+`router.config.json` 控制：
+
+- `routing.tiers`：各档位的 `primary` / `fallback` 后端 ID
+- `routing.scoring` / `classifier` / `overrides`：分档关键词与阈值
+- `backends`：各后端的 `baseUrl`、`model`、`apiKey`、`requestParams`
+- `policy`：`defaultTier`、`maxFallbackAttempts`、`retryStatuses`
+
+修改配置后无需重启：
+
+```bash
+curl -X POST http://127.0.0.1:38080/reload
+```
 
 ## 快速启动
 
 ```bash
 cd openclaw-local-gateway
 npm install
-cp env.example .env
+cp router.config.example.json router.config.json   # 填写 backends.apiKey
+cp env.example .env                                # 可选，仅网关运行时参数
 npm run start:env
 ```
 
@@ -121,16 +144,19 @@ OpenClaw provider 的 `baseUrl` 设置为：
 
 ## 运行时环境变量
 
+`.env` 仅用于网关行为调优；模型连接统一在 `router.config.json` 的 `backends` 中配置。
+
 - `GATEWAY_PORT`：网关端口（默认 `38080`）
 - `GATEWAY_DRY_RUN`：`1/true` 时仅返回路由结果，不请求上游
 - `GATEWAY_DEDUP_WINDOW_MS`：重复请求拦截时间窗口
 - `GATEWAY_SESSION_TTL_MS`：内存会话路由 TTL（默认 `1800000`，30 分钟）
 - `GATEWAY_MAX_MESSAGES`：消息列表上限；保留全部 system/developer，对话区只保留最近 N 条（默认 `60`）
 - `GATEWAY_COMPRESSION_THRESHOLD_KB`：请求体超过此大小（KB）时触发消息压缩（默认 `180`）
-- `VLLM_SIMPLE_BASE` / `VLLM_SIMPLE_MODEL`：SIMPLE 档目标
-- `VLLM_DEFAULT_BASE` / `VLLM_DEFAULT_MODEL` / `VLLM_DEFAULT_API_KEY`：非 SIMPLE 档默认回退目标与鉴权（若未配置档位专用项）
+- `GATEWAY_REQUEST_LOG_FILE`：请求日志路径（默认 `./logs/gateway-requests.json`）
+- `GATEWAY_CONFIG_PATH` / `ROUTER_CONFIG_PATH`：配置文件路径（默认 `./router.config.json`）
 
 ## 接口
 
 - `GET /health`
+- `POST /reload`（热重载 `router.config.json`，清空内存会话）
 - `POST /v1/chat/completions`
