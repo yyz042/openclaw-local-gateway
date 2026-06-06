@@ -252,6 +252,78 @@ export function getBackend(id: string): BackendConfig {
   return backend;
 }
 
+/** 返回 router.config 中全部已配置后端（只读快照）。 */
+export function getConfiguredBackends(): Record<string, BackendConfig> {
+  return state.raw.backends ?? {};
+}
+
+/** 健康探测用鉴权头（与 example-router 一致：无 key 时发 Bearer EMPTY）。 */
+export function authorizationHeaderForProbe(backend: BackendConfig): Record<string, string> {
+  const key = backend.apiKey?.trim();
+  if (key && key !== "EMPTY") {
+    const auth = key.startsWith("Bearer ") ? key : `Bearer ${key}`;
+    return { Authorization: auth };
+  }
+  return { Authorization: "Bearer EMPTY" };
+}
+
+/** OpenAI 兼容模型列表：每个 backend 映射为 local-router/{backendId}。 */
+export function listGatewayModels(): Array<{
+  id: string;
+  object: "model";
+  owned_by: string;
+  metadata: { upstream_model: string; upstream_base_url: string };
+}> {
+  return Object.entries(getConfiguredBackends()).map(([backendId, backend]) => ({
+    id: `local-router/${backendId}`,
+    object: "model",
+    owned_by: "openclaw-local-gateway",
+    metadata: {
+      upstream_model: backend.model,
+      upstream_base_url: backend.baseUrl,
+    },
+  }));
+}
+
+export type BackendHealthCheck = {
+  backendId: string;
+  ok: boolean;
+  status: number;
+  baseUrl: string;
+  model: string;
+  error?: string;
+};
+
+/** 对每个 backend 请求 GET /models，探测上游连通性。 */
+export async function probeAllBackends(): Promise<BackendHealthCheck[]> {
+  return Promise.all(
+    Object.entries(getConfiguredBackends()).map(async ([backendId, backend]) => {
+      const baseUrl = backend.baseUrl.replace(/\/$/, "");
+      try {
+        const response = await fetch(`${baseUrl}/models`, {
+          headers: authorizationHeaderForProbe(backend),
+        });
+        return {
+          backendId,
+          ok: response.ok,
+          status: response.status,
+          baseUrl: backend.baseUrl,
+          model: backend.model,
+        };
+      } catch (error) {
+        return {
+          backendId,
+          ok: false,
+          status: 0,
+          baseUrl: backend.baseUrl,
+          model: backend.model,
+          error: error instanceof Error ? error.message : String(error),
+        };
+      }
+    }),
+  );
+}
+
 /** 按 tier 解析 primary + fallback 链，受 maxFallbackAttempts 限制。 */
 export function resolveBackendIdsForTier(tier: Tier): string[] {
   const { maxFallbackAttempts } = getPolicy();

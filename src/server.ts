@@ -17,7 +17,9 @@ import {
   getBackend,
   getPolicy,
   getRouterConfigState,
+  listGatewayModels,
   normalizeTier,
+  probeAllBackends,
   reloadRouterConfig,
   resolveBackendIdsForTier,
   type Tier,
@@ -364,6 +366,7 @@ function setRouteResponseHeaders(
     sessionId: string | null;
     targetModel: string;
     selectedBackend?: string;
+    hasTools?: boolean;
     contextGovernance?: ContextGovernanceMeta;
     sessionJournalInjected?: boolean;
   },
@@ -373,6 +376,8 @@ function setRouteResponseHeaders(
   res.setHeader("x-route-method", String(params.decision.method ?? ""));
   res.setHeader("x-route-reason", params.routeReason);
   res.setHeader("x-upstream-model", params.targetModel);
+  if (params.hasTools !== undefined) res.setHeader("x-route-has-tools", params.hasTools ? "true" : "false");
+  if (params.decision.model) res.setHeader("x-route-clawrouter-model", String(params.decision.model));
   if (params.selectedBackend) res.setHeader("x-route-selected-backend", params.selectedBackend);
   if (params.sessionId) res.setHeader("x-route-session-id", params.sessionId);
   if (params.contextGovernance?.wasTruncated) res.setHeader("x-route-messages-truncated", "true");
@@ -548,11 +553,12 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     console.log(`[gateway] context_governance compressed chars_saved=${contextGovernance.charsSaved}`);
   }
   const maxTokens = maxOutputTokens(body);
+  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const { routingConfig, modelPricing } = getRouterConfigState();
   const decision = route(prompt, systemPrompt || undefined, maxTokens, {
     config: routingConfig,
     modelPricing,
-    hasTools: Array.isArray(body.tools) && body.tools.length > 0,
+    hasTools,
   });
   const proposedTier = normalizeTier(decision.tier);
   const usedDefaultTier = !isTier(decision.tier) || proposedTier !== decision.tier;
@@ -602,6 +608,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       routeReason,
       sessionId,
       targetModel: target.model,
+      hasTools,
       contextGovernance,
     });
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -614,6 +621,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
         route_reason: routeReason,
         session_id: sessionId,
         confidence: routedConfidence,
+        has_tools: hasTools,
         reasoning: decision.reasoning,
         upstream: target,
         backend_ids: backendIds,
@@ -661,6 +669,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       sessionId,
       targetModel: selectedBackend.model,
       selectedBackend: selectedBackendId,
+      hasTools,
       contextGovernance,
       sessionJournalInjected: journalInjection.injected,
     });
@@ -737,6 +746,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     sessionId,
     targetModel: selectedBackend.model,
     selectedBackend: selectedBackendId,
+    hasTools,
     contextGovernance,
     sessionJournalInjected: journalInjection.injected,
   });
@@ -789,15 +799,24 @@ const server = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url?.startsWith("/health")) {
       const configState = getRouterConfigState();
+      const backends = await probeAllBackends();
+      const allBackendsOk = backends.length > 0 && backends.every((check) => check.ok);
       res.writeHead(200, { "Content-Type": "application/json" });
       res.end(
         JSON.stringify({
-          status: "ok",
+          ok: allBackendsOk,
+          status: allBackendsOk ? "ok" : "degraded",
           service: "openclaw-local-gateway",
           configPath: configState.configPath,
           configSource: configState.source,
+          backends,
         }),
       );
+      return;
+    }
+    if (req.method === "GET" && (req.url === "/v1/models" || req.url?.startsWith("/v1/models?"))) {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ object: "list", data: listGatewayModels() }));
       return;
     }
     if (req.method === "POST" && req.url === "/reload") {
@@ -844,5 +863,6 @@ server.listen(port, "127.0.0.1", () => {
       ? `router.config.json (${configState.configPath})`
       : "环境变量 VLLM_*（未找到 router.config.json）";
   console.log(`[openclaw-local-gateway] listening http://127.0.0.1:${port}/v1/chat/completions`);
+  console.log(`[openclaw-local-gateway] 可观测接口: GET /health, GET /v1/models, POST /reload`);
   console.log(`[openclaw-local-gateway] 配置来源: ${configLabel}`);
 });
