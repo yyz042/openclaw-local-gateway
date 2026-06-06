@@ -1,5 +1,7 @@
 .env
+router.config.json
 node_modules
 src/**/*.js.map
 /example-router
 .DS_Store
+.env.real
