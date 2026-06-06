@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-/** OpenAI 兼容消息结构（仅治理所需字段）。 */
+/** OpenAI-compatible message shape (fields needed for governance only). */
 export type GovernableMessage = {
   role?: string;
   content?: unknown;
@@ -23,14 +23,14 @@ export type ContextGovernanceResult = {
 
 const MAX_MESSAGES = Number(process.env.GATEWAY_MAX_MESSAGES ?? "60");
 const COMPRESSION_THRESHOLD_KB = Number(process.env.GATEWAY_COMPRESSION_THRESHOLD_KB ?? "180");
-/** 消息总字符数超过此值时也触发压缩（与 example-router 一致）。 */
+/** Also compress when total message chars exceed this threshold (matches example-router). */
 const COMPRESS_CHARS_THRESHOLD = 5000;
 
 function hashText(text: string, length = 12): string {
   return createHash("sha256").update(text).digest("hex").slice(0, length);
 }
 
-/** 将 message.content 归一化为纯文本，便于估算长度与去重指纹。 */
+/** Normalize message.content to plain text for length estimates and dedup fingerprints. */
 function normalizeMessageContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -50,7 +50,7 @@ function normalizeMessageContent(content: unknown): string {
   return content == null ? "" : String(content);
 }
 
-/** 若内容为 JSON 对象/数组文本，则 minify 以节省 token。 */
+/** Minify JSON object/array text when content looks like JSON, to save tokens. */
 function compactJsonLikeText(text: string): string {
   const trimmed = text.trim();
   if (!trimmed || !/^[\[{]/.test(trimmed)) return text;
@@ -66,8 +66,8 @@ function calculateMessagesChars(messages: GovernableMessage[]): number {
 }
 
 /**
- * 超长消息列表截断：保留全部 system/developer，对话区只保留最近 N 条。
- * N 由 GATEWAY_MAX_MESSAGES 控制，system/developer 不计入对话配额。
+ * Truncate long message lists: keep all system/developer messages, retain only the last N conversation turns.
+ * N is controlled by GATEWAY_MAX_MESSAGES; system/developer messages do not count toward the cap.
  */
 export function truncateMessages(messages: GovernableMessage[]): {
   messages: GovernableMessage[];
@@ -93,9 +93,9 @@ export function truncateMessages(messages: GovernableMessage[]): {
 }
 
 /**
- * 大请求压缩：
- * - 跳过重复的长消息（role + 内容哈希相同且 >200 字）；
- * - 对 string 型 JSON 文本做 minify。
+ * Compress large requests:
+ * - Drop duplicate long messages (same role + content hash, length > 200 chars);
+ * - Minify string content that looks like JSON.
  */
 export function compressMessages(messages: GovernableMessage[]): {
   messages: GovernableMessage[];
@@ -129,8 +129,8 @@ export function compressMessages(messages: GovernableMessage[]): {
 }
 
 /**
- * 对即将转发的 chat 请求做长上下文治理：先截断，再按需压缩。
- * 压缩在整包体积或消息字符数超阈值时触发。
+ * Apply long-context governance before upstream forwarding: truncate first, then compress if needed.
+ * Compression runs when request size or total message chars exceed thresholds.
  */
 export function governMessages(messages: GovernableMessage[]): ContextGovernanceResult {
   if (!Array.isArray(messages)) {

@@ -24,9 +24,9 @@
       }
     },
     "scoring": {
-      "reasoningKeywords": ["prove", "theorem", "formal", "derive", "证明", "定理"],
-      "codeKeywords": ["function", "class", "async", "import", "函数", "类"],
-      "simpleKeywords": ["what is", "define", "hello", "你好", "天气"]
+      "reasoningKeywords": ["prove", "theorem", "formal", "derive", "proof"],
+      "codeKeywords": ["function", "class", "async", "import", "def", "struct"],
+      "simpleKeywords": ["what is", "define", "hello", "weather", "explain"]
     },
     "classifier": {
       "confidenceThreshold": 0.55

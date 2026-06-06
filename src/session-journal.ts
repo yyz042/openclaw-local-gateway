@@ -1,4 +1,4 @@
-/** 单条会话日志：从 assistant 回复中提取的关键动作。 */
+/** One session journal entry: a key action extracted from an assistant reply. */
 export type SessionJournalEntry = {
   time: string;
   action: string;
@@ -11,7 +11,7 @@ type JournalMessage = {
 
 const sessionJournals = new Map<string, SessionJournalEntry[]>();
 
-/** 将 message.content 归一化为纯文本（与 context-governance 一致）。 */
+/** Normalize message.content to plain text (same approach as context-governance). */
 function normalizeMessageContent(content: unknown): string {
   if (typeof content === "string") return content;
   if (Array.isArray(content)) {
@@ -31,7 +31,7 @@ function normalizeMessageContent(content: unknown): string {
   return content == null ? "" : String(content);
 }
 
-/** 识别「总结 / 回顾 / 进展」类 prompt，决定是否注入 session journal。 */
+/** Detect recap/summary/progress prompts to decide whether to inject session journal. */
 export function needsSessionJournal(prompt: string): boolean {
   const lower = prompt.toLowerCase();
   return [
@@ -53,18 +53,11 @@ export function needsSessionJournal(prompt: string): boolean {
     "your progress",
     "accomplished",
     "completed tasks",
-    "刚才",
-    "之前",
-    "前面",
-    "总结",
-    "做了什么",
-    "进展",
-    "继续",
+    "continue",
   ].some((trigger) => lower.includes(trigger));
 }
 
-/** 会话过期时同步清理 journal。 */
-/** 热重载配置时清空全部 session journal。 */
+/** Clear all session journals on config hot reload. */
 export function clearAllSessionJournals(): void {
   sessionJournals.clear();
 }
@@ -74,8 +67,8 @@ export function deleteSessionJournal(sessionId: string): void {
 }
 
 /**
- * 将内存中的 session journal 注入 system/developer 消息。
- * 若无匹配会话或 journal 为空，则原样返回 body。
+ * Inject in-memory session journal into system/developer messages.
+ * Returns the original body when there is no session or journal is empty.
  */
 export function injectSessionJournal<T extends Record<string, unknown> & { messages?: JournalMessage[] }>(
   body: T,
@@ -110,7 +103,7 @@ export function injectSessionJournal<T extends Record<string, unknown> & { messa
   return { body: nextBody, injected: true };
 }
 
-/** 从非流式 chat completion JSON 中提取 assistant 文本。 */
+/** Extract assistant text from a non-streaming chat completion JSON body. */
 export function extractAssistantTextFromJson(text: string): string {
   try {
     const parsed = JSON.parse(text) as {
@@ -128,7 +121,7 @@ export function extractAssistantTextFromJson(text: string): string {
   return "";
 }
 
-/** 从 SSE 聚合文本中提取 assistant 内容（兜底解析）。 */
+/** Extract assistant content from aggregated SSE text (fallback parser). */
 export function extractAssistantTextFromSse(text: string): string {
   const parts: string[] = [];
   for (const line of text.split(/\r?\n/)) {
@@ -145,15 +138,15 @@ export function extractAssistantTextFromSse(text: string): string {
         if (content) parts.push(content);
       }
     } catch {
-      // 忽略非 JSON SSE 片段。
+      // Ignore non-JSON SSE chunks.
     }
   }
   return parts.join("");
 }
 
 /**
- * 从 assistant 回复中提取关键动作并写入 session journal。
- * 与 example-router 一致：英文动词短语 + 中文动作句，最多 4 条/轮。
+ * Extract key actions from assistant replies and append to session journal.
+ * Matches example-router: English verb phrases, up to 4 entries per turn.
  */
 export function recordSessionJournal(sessionId: string | null, modelLabel: string, assistantText: string): void {
   if (!sessionId || !assistantText) return;
@@ -161,7 +154,6 @@ export function recordSessionJournal(sessionId: string | null, modelLabel: strin
   const events: string[] = [];
   const patterns = [
     /(?:created|updated|modified|added|removed|fixed|implemented|configured|wrote|changed)\s+[^.\n]{8,180}/gi,
-    /(?:创建|更新|修改|新增|删除|修复|实现|配置|调整)[^。\n]{4,120}/g,
   ];
 
   for (const pattern of patterns) {
