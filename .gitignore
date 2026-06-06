@@ -5,3 +5,4 @@ src/**/*.js.map
 /example-router
 .DS_Store
 .env.real
+logs/
