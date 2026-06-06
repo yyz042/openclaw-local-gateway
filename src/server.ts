@@ -10,6 +10,12 @@ import {
   type RoutingDecision,
 } from "@blockrun/clawrouter";
 import { governMessages, type ContextGovernanceMeta } from "./context-governance.js";
+import {
+  deleteSessionJournal,
+  extractAssistantTextFromJson,
+  injectSessionJournal,
+  recordSessionJournal,
+} from "./session-journal.js";
 
 /** 覆盖 @blockrun/clawrouter 默认的 scoring.confidenceThreshold（包内约 0.7）。 */
 const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
@@ -263,7 +269,10 @@ function hashRequestContent(prompt: string, body: Record<string, unknown>): stri
 function cleanupSessions(): void {
   const cutoff = Date.now() - SESSION_TTL_MS;
   for (const [sessionId, session] of sessions.entries()) {
-    if (session.updatedAt < cutoff) sessions.delete(sessionId);
+    if (session.updatedAt < cutoff) {
+      sessions.delete(sessionId);
+      deleteSessionJournal(sessionId);
+    }
   }
 }
 
@@ -354,6 +363,7 @@ function setRouteResponseHeaders(
     sessionId: string | null;
     targetModel: string;
     contextGovernance?: ContextGovernanceMeta;
+    sessionJournalInjected?: boolean;
   },
 ): void {
   res.setHeader("x-route-tier", params.routedTier);
@@ -364,6 +374,7 @@ function setRouteResponseHeaders(
   if (params.sessionId) res.setHeader("x-route-session-id", params.sessionId);
   if (params.contextGovernance?.wasTruncated) res.setHeader("x-route-messages-truncated", "true");
   if (params.contextGovernance?.wasCompressed) res.setHeader("x-route-messages-compressed", "true");
+  if (params.sessionJournalInjected) res.setHeader("x-route-session-journal-injected", "true");
 }
 
 function isGatewayDryRun(): boolean {
@@ -629,8 +640,12 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} route_reason=${routeReason} session=${sessionId ?? "none"} target=${target.model} base=${target.baseUrl} stream=${stream}`,
   );
 
+  const journalInjection = injectSessionJournal(body, sessionId, prompt);
+  if (journalInjection.injected) {
+    console.log(`[gateway] session_journal injected session=${sessionId}`);
+  }
   const forwardBody = {
-    ...body,
+    ...journalInjection.body,
     model: target.model,
   };
   const auth = authorizationForTier(routedTier, req);
@@ -649,6 +664,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       sessionId,
       targetModel: target.model,
       contextGovernance,
+      sessionJournalInjected: journalInjection.injected,
     });
     res.writeHead(upstream.status, {
       "Content-Type": upstream.headers.get("content-type") ?? "text/event-stream",
@@ -702,6 +718,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       res.write(Buffer.from(value));
     }
     res.end();
+    if (upstream.ok) {
+      recordSessionJournal(sessionId, target.model, fullContent);
+    }
     console.log(
       `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
     );
@@ -709,6 +728,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   }
 
   const text = await upstream.text();
+  if (upstream.ok) {
+    recordSessionJournal(sessionId, target.model, extractAssistantTextFromJson(text));
+  }
   setRouteResponseHeaders(res, {
     routedTier,
     routedConfidence,
@@ -717,6 +739,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     sessionId,
     targetModel: target.model,
     contextGovernance,
+    sessionJournalInjected: journalInjection.injected,
   });
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
