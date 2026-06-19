@@ -10,6 +10,7 @@
 - **本地使用优化**：短时间窗口内拦截重复请求，减少误触发重复执行。
 - **会话级智能路由**：多轮对话固定档位、复杂任务升档、相似请求三次升档，简单追问可走轻量模型且不降级会话记忆。
 - **长上下文治理**：超长消息列表截断（保留 system/developer + 最近对话）、大请求压缩（去重重复消息、压缩 JSON 文本）。
+- **轻量会话记忆**：识别「总结/回顾/进展」类 prompt 注入 session journal；从 assistant 回复提取关键动作并记录。
 - **回退策略完善**：支持按 tier 的 endpoint/model/api-key 映射，并具备默认回退机制。
 
 ## ClawRouter routing 思想
@@ -76,12 +77,22 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 
 **可观测字段**：响应头 `x-route-messages-truncated`、`x-route-messages-compressed`；日志 `[gateway] context_governance …`；dry-run JSON 的 `context_governance`。
 
+## 轻量会话记忆
+
+内存中维护 **session journal**（与 `GATEWAY_SESSION_TTL_MS` 同生命周期），不持久化到磁盘：
+
+1. **记录**：上游成功返回后，从 assistant 文本中用正则提取关键动作（如「创建/修复/实现…」或英文 `created/fixed/implemented…`），写入该会话 journal（最多保留 20 条）。
+2. **注入**：当最后一条 user 消息命中「总结/回顾/进展」类关键词（如「总结」「刚才」「进展」「recap」「summarize」等），将最近 8 条 journal 以 `[Session Memory - Key Actions]` 前缀注入 `system`/`developer` 消息（无则新建 system）。
+3. **时机**：在 OpenClaw 清洗与长上下文治理之后、转发上游之前注入；仅真实转发时记录（dry-run 不写 journal）。
+
+**可观测字段**：响应头 `x-route-session-journal-injected`；日志 `[gateway] session_journal injected …`。
+
 ## 明确移除的部分
 
 - x402 支付
 - 钱包/鉴权生命周期
 - 合作方与 provider 插件体系
-- 持久化会话库 / session journal（仅保留轻量内存会话路由）
+- 持久化会话库（仅保留轻量内存会话路由与内存 session journal）
 
 ## 请求处理流程
 
@@ -90,9 +101,10 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 3. 长上下文治理：截断超长消息列表、按需压缩大请求。
 4. 对最后一条 user 消息用 ClawRouter 得出 `proposed_tier`。
 5. 应用会话级规则（固定、升档、SIMPLE 追问、三次升档）。
-6. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
-7. 转发并透传响应（保留 SSE 与 tool-call 数据）。
-8. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
+6. 按需注入 session journal（总结/回顾类 prompt）。
+7. 解析上游目标（优先 `VLLM_<TIER>_*`，否则使用默认回退）。
+8. 转发并透传响应（保留 SSE 与 tool-call 数据）；成功后从 assistant 回复提取关键动作写入 journal。
+9. 输出请求、路由、上游完成日志（含 `route_reason` 与会话字段）。
 
 ## 快速启动
 
