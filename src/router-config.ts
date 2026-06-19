@@ -111,6 +111,19 @@ function buildRoutingConfigFromRaw(routing?: RawRouterConfig["routing"]): Routin
     config.overrides.maxTokensForceComplex = routing.overrides.largeContextTokens;
   }
 
+  // 将 router.config.json 的 tier→backend 链同步到 clawrouter，使后端 ID 与自定义定价参与 route() 成本估算。
+  const tiers = routing?.tiers;
+  if (tiers) {
+    for (const tier of VALID_TIERS) {
+      const tierConfig = tiers[tier];
+      if (!tierConfig?.primary) continue;
+      config.tiers[tier] = {
+        primary: tierConfig.primary,
+        fallback: tierConfig.fallback ?? [],
+      };
+    }
+  }
+
   return config;
 }
 
