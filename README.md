@@ -10,7 +10,8 @@ A lightweight local gateway for OpenClaw that borrows the routing core of `@bloc
 - **Safer local usage**: blocks duplicate requests in a short window to reduce accidental repeated execution.
 - **Session-aware routing**: keeps tier stable across turns, upgrades when complexity rises, and escalates after repeated similar prompts.
 - **Lightweight session memory**: injects an in-memory session journal for recap/summary prompts and records key actions from assistant replies.
-- **Production-friendly fallback behavior**: tier-specific endpoint/model/api-key mapping with sensible default fallbacks.
+- **JSON-driven config**: `router.config.json` unifies tier→backend mapping, fallback chains, keywords, thresholds, and backend URL/model/API keys; `POST /reload` hot-reloads without restart.
+- **Production-friendly fallback behavior**: primary + fallback backend chains with automatic retry on configurable HTTP status codes.
 
 ## ClawRouter routing ideas used here
 
@@ -106,16 +107,25 @@ An in-memory **session journal** (same TTL as `GATEWAY_SESSION_TTL_MS`, not pers
 4. Route the last user message to a proposed tier (`SIMPLE/MEDIUM/COMPLEX/REASONING`) using ClawRouter logic.
 5. Apply session-level rules (pin, upgrade, SIMPLE follow-up, three-strike escalation).
 6. Inject session journal when the prompt asks for recap/summary/progress.
-7. Resolve upstream target (`VLLM_<TIER>_*` or default fallback).
+7. Resolve upstream target (`router.config.json` `routing.tiers` + `backends`).
 8. Forward request and stream response back (SSE and tool-call chunks preserved); record key actions from assistant replies.
 9. Emit request/routing/upstream completion logs (including `route_reason` and session fields).
+
+## JSON-driven config
+
+```bash
+cp router.config.example.json router.config.json
+# edit backends / tiers / scoring, then hot-reload:
+curl -X POST http://127.0.0.1:38080/reload
+```
 
 ## Quick start
 
 ```bash
 cd openclaw-local-gateway
 npm install
-cp env.example .env
+cp router.config.example.json router.config.json   # fill backends.apiKey
+cp env.example .env                                # optional, gateway runtime knobs only
 npm run start:env
 ```
 
@@ -125,14 +135,19 @@ OpenClaw provider `baseUrl`:
 
 ## Runtime knobs (env)
 
+`.env` tunes gateway behavior only; model upstreams live in `router.config.json` `backends`.
+
 - `GATEWAY_PORT`: local gateway port (default `38080`)
 - `GATEWAY_DRY_RUN`: if `1/true`, return routing result without upstream calls
 - `GATEWAY_DEDUP_WINDOW_MS`: duplicate-request guard window
 - `GATEWAY_SESSION_TTL_MS`: in-memory session routing TTL (default `1800000`, 30 minutes)
-- `VLLM_SIMPLE_BASE` / `VLLM_SIMPLE_MODEL`: SIMPLE-tier target
-- `VLLM_DEFAULT_BASE` / `VLLM_DEFAULT_MODEL` / `VLLM_DEFAULT_API_KEY`: fallback target/auth for non-SIMPLE tiers (unless tier-specific key/base is set)
+- `GATEWAY_MAX_MESSAGES`: message list cap (default `60`)
+- `GATEWAY_COMPRESSION_THRESHOLD_KB`: compress when body exceeds this size in KB (default `180`)
+- `GATEWAY_REQUEST_LOG_FILE`: request log path (default `./logs/gateway-requests.json`)
+- `GATEWAY_CONFIG_PATH` / `ROUTER_CONFIG_PATH`: config file path (default `./router.config.json`)
 
 ## Endpoints
 
 - `GET /health`
+- `POST /reload` (hot-reload `router.config.json`, clears in-memory sessions)
 - `POST /v1/chat/completions`

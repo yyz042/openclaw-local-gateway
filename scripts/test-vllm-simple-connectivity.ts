@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { setTimeout as sleep } from "node:timers/promises";
+import { getBackend, getTierBackendConfig } from "../src/router-config.js";
 
 function fail(message: string): never {
   throw new Error(`[test:vllm-simple] ${message}`);
@@ -44,8 +45,11 @@ function startGatewayForTest(port: number): ChildProcess {
 }
 
 async function main() {
-  if (!process.env.VLLM_SIMPLE_BASE) fail("missing env: VLLM_SIMPLE_BASE");
-  if (!process.env.VLLM_SIMPLE_MODEL) fail("missing env: VLLM_SIMPLE_MODEL");
+  const tierConfig = getTierBackendConfig("SIMPLE");
+  if (!tierConfig?.primary) {
+    fail("router.config.json missing routing.tiers.SIMPLE.primary");
+  }
+  const backend = getBackend(tierConfig.primary);
 
   const testPort = Number(process.env.GATEWAY_TEST_PORT ?? "38081");
   const gatewayBaseUrl = `http://127.0.0.1:${testPort}`;
@@ -83,7 +87,7 @@ async function main() {
     }
 
     console.log(`[test:vllm-simple] success`);
-    console.log(`[test:vllm-simple] routed SIMPLE model env=${process.env.VLLM_SIMPLE_MODEL}`);
+    console.log(`[test:vllm-simple] routed SIMPLE backend=${tierConfig.primary} model=${backend.model}`);
     console.log(`[test:vllm-simple] prompt=${JSON.stringify(prompt)}`);
     console.log(`[test:vllm-simple] reply=${JSON.stringify(content.trim())}`);
   } finally {

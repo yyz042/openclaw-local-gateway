@@ -2,36 +2,31 @@ import { createServer, type IncomingMessage, type ServerResponse } from "node:ht
 import { createHash } from "node:crypto";
 import { appendFile, mkdir } from "node:fs/promises";
 import { dirname, resolve } from "node:path";
-import {
-  BLOCKRUN_MODELS,
-  DEFAULT_ROUTING_CONFIG,
-  route,
-  type RoutingConfig,
-  type RoutingDecision,
-} from "@blockrun/clawrouter";
+import { route, type RoutingConfig, type RoutingDecision } from "@blockrun/clawrouter";
 import { governMessages, type ContextGovernanceMeta } from "./context-governance.js";
 import {
+  clearAllSessionJournals,
   deleteSessionJournal,
   extractAssistantTextFromJson,
   injectSessionJournal,
   recordSessionJournal,
 } from "./session-journal.js";
-
-/** 覆盖 @blockrun/clawrouter 默认的 scoring.confidenceThreshold（包内约 0.7）。 */
-const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
-  ...DEFAULT_ROUTING_CONFIG,
-  scoring: {
-    ...DEFAULT_ROUTING_CONFIG.scoring,
-    confidenceThreshold:0.55,
-  },
-};
-
-type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
+import {
+  authorizationForBackend,
+  buildUpstreamBody,
+  getBackend,
+  getPolicy,
+  getRouterConfigState,
+  normalizeTier,
+  reloadRouterConfig,
+  resolveBackendIdsForTier,
+  type Tier,
+  VALID_TIERS,
+} from "./router-config.js";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
 const SESSION_TTL_MS = Number(process.env.GATEWAY_SESSION_TTL_MS ?? String(30 * 60 * 1000));
 const REQUEST_LOG_FILE = resolve(process.env.GATEWAY_REQUEST_LOG_FILE ?? "./logs/gateway-requests.json");
-const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
 const TIER_ORDER: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
 
 type SessionRouteReason =
@@ -79,8 +74,8 @@ function collectReasoningKeywordMatches(prompt: string, keywords: readonly strin
 }
 
 /** 仅按加权分与 tierBoundaries 映射档位（不含「≥2 推理词」等覆盖规则）。 */
-function tierFromWeightedScoreOnly(score: number): Tier {
-  const { simpleMedium, mediumComplex, complexReasoning } = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
+function tierFromWeightedScoreOnly(score: number, routingConfig: RoutingConfig): Tier {
+  const { simpleMedium, mediumComplex, complexReasoning } = routingConfig.scoring.tierBoundaries;
   if (score < simpleMedium) return "SIMPLE";
   if (score < mediumComplex) return "MEDIUM";
   if (score < complexReasoning) return "COMPLEX";
@@ -104,26 +99,38 @@ function buildScoringDetailLog(params: {
   usedDefaultTier: boolean;
   sessionId: string | null;
   routeReason: SessionRouteReason;
+  routingConfig: RoutingConfig;
 }): Record<string, unknown> {
-  const { decision, proposedTier, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens, sessionId, routeReason } =
-    params;
+  const {
+    decision,
+    proposedTier,
+    routedTier,
+    usedDefaultTier,
+    prompt,
+    systemPrompt,
+    maxOutputTokens,
+    sessionId,
+    routeReason,
+    routingConfig,
+  } = params;
   const reasoning = decision.reasoning;
   const weightedScore = parseWeightedScoreFromReasoning(reasoning);
-  const boundaries = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
-  const overrides = GATEWAY_ROUTING_CONFIG.overrides;
-  const reasoningKw = collectReasoningKeywordMatches(prompt, GATEWAY_ROUTING_CONFIG.scoring.reasoningKeywords);
+  const boundaries = routingConfig.scoring.tierBoundaries;
+  const overrides = routingConfig.overrides;
+  const reasoningKw = collectReasoningKeywordMatches(prompt, routingConfig.scoring.reasoningKeywords);
   const estimatedTokens = estimateRouterInputTokens(prompt, systemPrompt);
   const forcedComplexByTokens = estimatedTokens > overrides.maxTokensForceComplex;
   const ambiguousBranch = reasoning.includes("ambiguous ->");
   const structuredUpgrade = reasoning.includes("upgraded to") && reasoning.includes("structured output");
   const hasStructuredSystemHint = /json|structured|schema/i.test(systemPrompt);
-  const scoreOnlyTier = weightedScore !== undefined ? tierFromWeightedScoreOnly(weightedScore) : undefined;
+  const scoreOnlyTier =
+    weightedScore !== undefined ? tierFromWeightedScoreOnly(weightedScore, routingConfig) : undefined;
   const reasoningKeywordTierBoost = reasoningKw.length >= 2;
 
   const explanations: string[] = [];
   if (usedDefaultTier) {
     explanations.push(
-      `网关将路由层返回的档位「${String(decision.tier ?? "undefined")}」视为无效，已回退为环境变量 VLLM_DEFAULT_TIER（当前生效：${routedTier}）。`,
+      `网关将路由层返回的档位「${String(decision.tier ?? "undefined")}」规范化为 policy.defaultTier（当前生效：${proposedTier}）。`,
     );
   }
   if (forcedComplexByTokens) {
@@ -138,7 +145,7 @@ function buildScoringDetailLog(params: {
   }
   if (ambiguousBranch) {
     explanations.push(
-      `规则置信度低于 confidenceThreshold=${GATEWAY_ROUTING_CONFIG.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
+      `规则置信度低于 confidenceThreshold=${routingConfig.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
     );
   }
   if (weightedScore !== undefined && scoreOnlyTier !== undefined) {
@@ -209,12 +216,6 @@ function buildScoringDetailLog(params: {
 // 只保留短时间内的请求指纹，用来拦截重复请求。
 const recentRequests = new Map<string, number>();
 let requestLogWriteQueue: Promise<void> = Promise.resolve();
-const modelPricing = new Map(
-  BLOCKRUN_MODELS.map((model) => [
-    model.id,
-    { inputPrice: model.inputPrice, outputPrice: model.outputPrice },
-  ]),
-);
 
 type ChatMessage = {
   role?: string;
@@ -337,7 +338,7 @@ function applySessionRouting(
   }
 
   if (hashCount >= 3) {
-    const escalatedTier = nextTier(selectedTier);
+    const escalatedTier = normalizeTier(nextTier(selectedTier));
     if (getTierRank(escalatedTier) > getTierRank(selectedTier)) {
       selectedTier = escalatedTier;
       storedTier = escalatedTier;
@@ -362,6 +363,7 @@ function setRouteResponseHeaders(
     routeReason: SessionRouteReason;
     sessionId: string | null;
     targetModel: string;
+    selectedBackend?: string;
     contextGovernance?: ContextGovernanceMeta;
     sessionJournalInjected?: boolean;
   },
@@ -371,6 +373,7 @@ function setRouteResponseHeaders(
   res.setHeader("x-route-method", String(params.decision.method ?? ""));
   res.setHeader("x-route-reason", params.routeReason);
   res.setHeader("x-upstream-model", params.targetModel);
+  if (params.selectedBackend) res.setHeader("x-route-selected-backend", params.selectedBackend);
   if (params.sessionId) res.setHeader("x-route-session-id", params.sessionId);
   if (params.contextGovernance?.wasTruncated) res.setHeader("x-route-messages-truncated", "true");
   if (params.contextGovernance?.wasCompressed) res.setHeader("x-route-messages-compressed", "true");
@@ -470,33 +473,6 @@ function isTier(value: unknown): value is Tier {
   return typeof value === "string" && VALID_TIERS.includes(value as Tier);
 }
 
-function defaultTier(): Tier {
-  const envTier = String(process.env.VLLM_DEFAULT_TIER ?? "MEDIUM").toUpperCase();
-  return isTier(envTier) ? envTier : "MEDIUM";
-}
-
-function tierTarget(tier: Tier): { baseUrl: string; model: string } {
-  // 先读当前档位配置，没配再回退到默认配置。
-  const defBase = (process.env.VLLM_DEFAULT_BASE ?? "").replace(/\/$/, "");
-  const defModel = process.env.VLLM_DEFAULT_MODEL ?? "default";
-  const envBase = (process.env[`VLLM_${tier}_BASE`] ?? "").replace(/\/$/, "");
-  const envModel = process.env[`VLLM_${tier}_MODEL`] ?? defModel;
-  const baseUrl = envBase || defBase;
-  if (!baseUrl) throw new Error(`No base for ${tier}; set VLLM_${tier}_BASE or VLLM_DEFAULT_BASE.`);
-  return { baseUrl, model: envModel };
-}
-
-function authorizationForTier(tier: Tier, req: IncomingMessage): string | undefined {
-  // 非 SIMPLE 档可回退默认密钥；SIMPLE 优先沿用请求头凭据。
-  const tierKey = process.env[`VLLM_${tier}_API_KEY`]?.trim();
-  if (tierKey) return tierKey.startsWith("Bearer ") ? tierKey : `Bearer ${tierKey}`;
-  if (tier !== "SIMPLE") {
-    const defKey = process.env.VLLM_DEFAULT_API_KEY?.trim();
-    if (defKey) return defKey.startsWith("Bearer ") ? defKey : `Bearer ${defKey}`;
-  }
-  return req.headers.authorization ? String(req.headers.authorization) : undefined;
-}
-
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     const chunks: Buffer[] = [];
@@ -572,12 +548,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     console.log(`[gateway] context_governance compressed chars_saved=${contextGovernance.charsSaved}`);
   }
   const maxTokens = maxOutputTokens(body);
+  const { routingConfig, modelPricing } = getRouterConfigState();
   const decision = route(prompt, systemPrompt || undefined, maxTokens, {
-    config: GATEWAY_ROUTING_CONFIG,
+    config: routingConfig,
     modelPricing,
+    hasTools: Array.isArray(body.tools) && body.tools.length > 0,
   });
-  const proposedTier = isTier(decision.tier) ? decision.tier : defaultTier();
-  const usedDefaultTier = !isTier(decision.tier);
+  const proposedTier = normalizeTier(decision.tier);
+  const usedDefaultTier = !isTier(decision.tier) || proposedTier !== decision.tier;
   const sessionId = getSessionId(req, messages);
   const sessionRoute = applySessionRouting(sessionId, proposedTier, prompt, body);
   const routedTier = sessionRoute.tier;
@@ -601,11 +579,20 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     usedDefaultTier,
     sessionId,
     routeReason,
+    routingConfig,
   });
   console.log("[gateway] scoring_detail", JSON.stringify(scoringDetail, null, 2));
 
   const dryRun = isGatewayDryRun();
-  const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routedTier);
+  const backendIds = resolveBackendIdsForTier(routedTier);
+  const primaryBackend = dryRun ? null : getBackend(backendIds[0]!);
+  const target = dryRun
+    ? { baseUrl: "(unset)", model: "(unset)", backendId: backendIds[0] ?? "(unset)" }
+    : {
+        baseUrl: primaryBackend!.baseUrl,
+        model: primaryBackend!.model,
+        backendId: backendIds[0]!,
+      };
   if (dryRun) {
     // dry-run 只返回路由结果，不访问上游服务。
     setRouteResponseHeaders(res, {
@@ -629,6 +616,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
         confidence: routedConfidence,
         reasoning: decision.reasoning,
         upstream: target,
+        backend_ids: backendIds,
         context_governance: contextGovernance,
       }),
     );
@@ -637,22 +625,31 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const stream = body.stream === true;
   console.log(
-    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} route_reason=${routeReason} session=${sessionId ?? "none"} target=${target.model} base=${target.baseUrl} stream=${stream}`,
+    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} route_reason=${routeReason} session=${sessionId ?? "none"} backends=${backendIds.join(">")} stream=${stream}`,
   );
 
   const journalInjection = injectSessionJournal(body, sessionId, prompt);
+  const forwardBody = journalInjection.body;
   if (journalInjection.injected) {
     console.log(`[gateway] session_journal injected session=${sessionId}`);
   }
-  const forwardBody = {
-    ...journalInjection.body,
-    model: target.model,
-  };
-  const auth = authorizationForTier(routedTier, req);
-  const upstream = await fetch(`${target.baseUrl}/chat/completions`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
-    body: JSON.stringify(forwardBody),
+
+  const { retryStatuses } = getPolicy();
+  let selectedBackendId = backendIds[0]!;
+  let selectedBackend = getBackend(selectedBackendId);
+  let upstream = await callUpstreamWithFallback({
+    req,
+    tier: routedTier,
+    backendIds,
+    body: forwardBody,
+    retryStatuses,
+    onFallback: (backendId, status) => {
+      console.warn(`[gateway] fallback backend=${backendId} status=${status} -> try next`);
+    },
+    onSelected: (backendId, backend) => {
+      selectedBackendId = backendId;
+      selectedBackend = backend;
+    },
   });
 
   if (stream && upstream.ok && upstream.body) {
@@ -662,7 +659,8 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       decision,
       routeReason,
       sessionId,
-      targetModel: target.model,
+      targetModel: selectedBackend.model,
+      selectedBackend: selectedBackendId,
       contextGovernance,
       sessionJournalInjected: journalInjection.injected,
     });
@@ -719,17 +717,17 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     }
     res.end();
     if (upstream.ok) {
-      recordSessionJournal(sessionId, target.model, fullContent);
+      recordSessionJournal(sessionId, selectedBackend.model, fullContent);
     }
     console.log(
-      `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
+      `[gateway] upstream_done caller=${caller} tier=${routedTier} backend=${selectedBackendId} model=${selectedBackend.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
     );
     return;
   }
 
   const text = await upstream.text();
   if (upstream.ok) {
-    recordSessionJournal(sessionId, target.model, extractAssistantTextFromJson(text));
+    recordSessionJournal(sessionId, selectedBackend.model, extractAssistantTextFromJson(text));
   }
   setRouteResponseHeaders(res, {
     routedTier,
@@ -737,22 +735,83 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     decision,
     routeReason,
     sessionId,
-    targetModel: target.model,
+    targetModel: selectedBackend.model,
+    selectedBackend: selectedBackendId,
     contextGovernance,
     sessionJournalInjected: journalInjection.injected,
   });
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
   console.log(
-    `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} body=${JSON.stringify(text)}`,
+    `[gateway] upstream_done caller=${caller} tier=${routedTier} backend=${selectedBackendId} model=${selectedBackend.model} status=${upstream.status} body=${JSON.stringify(text)}`,
   );
+}
+
+/** 按 fallback 链依次请求上游，遇可重试状态码则切换下一后端。 */
+async function callUpstreamWithFallback(params: {
+  req: IncomingMessage;
+  tier: Tier;
+  backendIds: string[];
+  body: Record<string, unknown>;
+  retryStatuses: number[];
+  onFallback: (backendId: string, status: number) => void;
+  onSelected: (backendId: string, backend: ReturnType<typeof getBackend>) => void;
+}): Promise<Response> {
+  const { req, tier, backendIds, body, retryStatuses, onFallback, onSelected } = params;
+  let lastResponse: Response | undefined;
+
+  for (const backendId of backendIds) {
+    const backend = getBackend(backendId);
+    onSelected(backendId, backend);
+    const auth = authorizationForBackend(backend, req, tier);
+    const upstreamBody = buildUpstreamBody(backend, body);
+    const targetUrl = `${backend.baseUrl.replace(/\/$/, "")}/chat/completions`;
+
+    lastResponse = await fetch(targetUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
+      body: JSON.stringify(upstreamBody),
+    });
+
+    if (lastResponse.ok || !retryStatuses.includes(lastResponse.status)) {
+      return lastResponse;
+    }
+    onFallback(backendId, lastResponse.status);
+  }
+
+  if (!lastResponse) {
+    throw new Error("无可用上游后端响应");
+  }
+  return lastResponse;
 }
 
 const server = createServer(async (req, res) => {
   try {
     if (req.method === "GET" && req.url?.startsWith("/health")) {
+      const configState = getRouterConfigState();
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ status: "ok", service: "openclaw-local-gateway" }));
+      res.end(
+        JSON.stringify({
+          status: "ok",
+          service: "openclaw-local-gateway",
+          configPath: configState.configPath,
+          configSource: configState.source,
+        }),
+      );
+      return;
+    }
+    if (req.method === "POST" && req.url === "/reload") {
+      const configState = reloadRouterConfig();
+      sessions.clear();
+      clearAllSessionJournals();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(
+        JSON.stringify({
+          ok: true,
+          configPath: configState.configPath,
+          configSource: configState.source,
+        }),
+      );
       return;
     }
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
@@ -779,5 +838,11 @@ server.on("error", (err: NodeJS.ErrnoException) => {
   process.exit(1);
 });
 server.listen(port, "127.0.0.1", () => {
+  const configState = getRouterConfigState();
+  const configLabel =
+    configState.source === "file"
+      ? `router.config.json (${configState.configPath})`
+      : "环境变量 VLLM_*（未找到 router.config.json）";
   console.log(`[openclaw-local-gateway] listening http://127.0.0.1:${port}/v1/chat/completions`);
+  console.log(`[openclaw-local-gateway] 配置来源: ${configLabel}`);
 });
