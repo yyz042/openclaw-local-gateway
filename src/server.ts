@@ -1,12 +1,174 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { createHash } from "node:crypto";
-import { DEFAULT_ROUTING_CONFIG } from "./router/config.js";
-import { routeByRules } from "./router/rules.js";
-import type { Tier } from "./router/types.js";
+import { appendFile, mkdir } from "node:fs/promises";
+import { dirname, resolve } from "node:path";
+import {
+  BLOCKRUN_MODELS,
+  DEFAULT_ROUTING_CONFIG,
+  route,
+  type RoutingConfig,
+  type RoutingDecision,
+} from "@blockrun/clawrouter";
+
+/** 覆盖 @blockrun/clawrouter 默认的 scoring.confidenceThreshold（包内约 0.7）。 */
+const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
+  ...DEFAULT_ROUTING_CONFIG,
+  scoring: {
+    ...DEFAULT_ROUTING_CONFIG.scoring,
+    confidenceThreshold:0.55,
+  },
+};
+
+type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
+const REQUEST_LOG_FILE = resolve(process.env.GATEWAY_REQUEST_LOG_FILE ?? "./logs/gateway-requests.json");
+const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+
+const SCORING_LOG_PROMPT_MAX = 480;
+
+function truncateForLog(text: string, maxChars: number): string {
+  const t = text.replace(/\s+/g, " ").trim();
+  if (t.length <= maxChars) return t;
+  return `${t.slice(0, maxChars)}…(共 ${t.length} 字)`;
+}
+
+function formatReasoningForLog(reasoning: string): string {
+  return reasoning.length > 4000 ? `${reasoning.slice(0, 4000)}…(已截断)` : reasoning;
+}
+
+/** 与 clawrouter 规则路由一致：从 reasoning 前缀解析加权分。 */
+function parseWeightedScoreFromReasoning(reasoning: string): number | undefined {
+  const m = reasoning.match(/^score=(-?\d+(?:\.\d+)?)/);
+  if (!m) return undefined;
+  const n = Number(m[1]);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+/** 与 classifyByRules 一致：仅对用户 prompt 小写文本匹配推理关键词。 */
+function collectReasoningKeywordMatches(prompt: string, keywords: readonly string[]): string[] {
+  const userText = prompt.toLowerCase();
+  return keywords.filter((kw) => userText.includes(kw.toLowerCase()));
+}
+
+/** 仅按加权分与 tierBoundaries 映射档位（不含「≥2 推理词」等覆盖规则）。 */
+function tierFromWeightedScoreOnly(score: number): Tier {
+  const { simpleMedium, mediumComplex, complexReasoning } = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
+  if (score < simpleMedium) return "SIMPLE";
+  if (score < mediumComplex) return "MEDIUM";
+  if (score < complexReasoning) return "COMPLEX";
+  return "REASONING";
+}
+
+function estimateRouterInputTokens(prompt: string, systemPrompt: string): number {
+  const fullText = `${systemPrompt ?? ""} ${prompt}`;
+  return Math.ceil(fullText.length / 4);
+}
+
+function buildScoringDetailLog(params: {
+  caller: string;
+  promptPreview: string;
+  prompt: string;
+  systemPrompt: string;
+  maxOutputTokens: number;
+  decision: RoutingDecision;
+  routedTier: Tier;
+  usedDefaultTier: boolean;
+}): Record<string, unknown> {
+  const { decision, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens } = params;
+  const reasoning = decision.reasoning;
+  const weightedScore = parseWeightedScoreFromReasoning(reasoning);
+  const boundaries = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
+  const overrides = GATEWAY_ROUTING_CONFIG.overrides;
+  const reasoningKw = collectReasoningKeywordMatches(prompt, GATEWAY_ROUTING_CONFIG.scoring.reasoningKeywords);
+  const estimatedTokens = estimateRouterInputTokens(prompt, systemPrompt);
+  const forcedComplexByTokens = estimatedTokens > overrides.maxTokensForceComplex;
+  const ambiguousBranch = reasoning.includes("ambiguous ->");
+  const structuredUpgrade = reasoning.includes("upgraded to") && reasoning.includes("structured output");
+  const hasStructuredSystemHint = /json|structured|schema/i.test(systemPrompt);
+  const scoreOnlyTier = weightedScore !== undefined ? tierFromWeightedScoreOnly(weightedScore) : undefined;
+  const reasoningKeywordTierBoost = reasoningKw.length >= 2;
+
+  const explanations: string[] = [];
+  if (usedDefaultTier) {
+    explanations.push(
+      `网关将路由层返回的档位「${String(decision.tier ?? "undefined")}」视为无效，已回退为环境变量 VLLM_DEFAULT_TIER（当前生效：${routedTier}）。`,
+    );
+  }
+  if (forcedComplexByTokens) {
+    explanations.push(
+      `估算输入约 ${estimatedTokens} tokens（超过 maxTokensForceComplex=${overrides.maxTokensForceComplex}），与 @blockrun/clawrouter 一致：强制 COMPLEX。`,
+    );
+  }
+  if (!forcedComplexByTokens && reasoningKeywordTierBoost && decision.tier === "REASONING") {
+    explanations.push(
+      `命中 ${reasoningKw.length} 个推理类关键词（≥2 即强制 REASONING），可覆盖仅凭分数轴得到的档位；若加权分仍低于 complexReasoning(${boundaries.complexReasoning})，属于预期行为。`,
+    );
+  }
+  if (ambiguousBranch) {
+    explanations.push(
+      `规则置信度低于 confidenceThreshold=${GATEWAY_ROUTING_CONFIG.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
+    );
+  }
+  if (weightedScore !== undefined && scoreOnlyTier !== undefined) {
+    explanations.push(
+      `加权分 ${weightedScore.toFixed(3)} 与阈值 simpleMedium=${boundaries.simpleMedium}、mediumComplex=${boundaries.mediumComplex}、complexReasoning=${boundaries.complexReasoning} 对比 → 纯分数轴为 ${scoreOnlyTier}；clawrouter 最终 tier=${decision.tier}。`,
+    );
+    if (decision.tier !== scoreOnlyTier && !reasoningKeywordTierBoost && !ambiguousBranch && !forcedComplexByTokens) {
+      explanations.push("若档位与分数轴不一致，请核对 reasoning 后缀（例如 structured output 升档）。");
+    }
+  }
+  if (structuredUpgrade) {
+    explanations.push("已触发 structured output 升档（reasoning 中含 upgraded … structured output）。");
+  } else if (hasStructuredSystemHint) {
+    explanations.push(
+      `系统提示含 json/structured/schema 线索；未出现升档说明当前 tier 已不低于 structuredOutputMinTier=${overrides.structuredOutputMinTier}。`,
+    );
+  }
+
+  return {
+    caller: params.caller,
+    prompt_preview: params.promptPreview,
+    estimated_input_tokens: estimatedTokens,
+    max_output_tokens: maxOutputTokens,
+    tier_boundaries: boundaries,
+    weighted_score: weightedScore ?? null,
+    tier_from_weighted_score_only: scoreOnlyTier ?? null,
+    reasoning_keyword_hits: reasoningKw.length,
+    reasoning_keywords_matched: reasoningKw.slice(0, 30),
+    routing: {
+      raw_tier: decision.tier,
+      final_tier: routedTier,
+      gateway_normalized_tier: usedDefaultTier,
+      confidence: decision.confidence,
+      method: decision.method,
+      profile: decision.profile ?? null,
+      model: decision.model,
+      agentic_score: decision.agenticScore ?? null,
+      cost_estimate: decision.costEstimate,
+      baseline_cost: decision.baselineCost,
+      savings: decision.savings,
+    },
+    flags: {
+      forced_complex_large_context: forcedComplexByTokens,
+      reasoning_keywords_force_reasoning: reasoningKeywordTierBoost,
+      ambiguous_low_confidence: ambiguousBranch,
+      structured_output_upgrade: structuredUpgrade,
+      system_has_structured_hint: hasStructuredSystemHint,
+    },
+    explanations_zh: explanations,
+    reasoning_full: formatReasoningForLog(reasoning),
+  };
+}
 // 只保留短时间内的请求指纹，用来拦截重复请求。
 const recentRequests = new Map<string, number>();
+let requestLogWriteQueue: Promise<void> = Promise.resolve();
+const modelPricing = new Map(
+  BLOCKRUN_MODELS.map((model) => [
+    model.id,
+    { inputPrice: model.inputPrice, outputPrice: model.outputPrice },
+  ]),
+);
 
 type ChatMessage = { role?: string; content?: unknown };
 
@@ -54,7 +216,7 @@ function cleanOpenClawUserText(text: string): string {
 
 function normalizeContentToText(content: unknown): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return "";
+  if (!Array.isArray(content)) return content == null ? "" : String(content);
   return (content as Array<{ type?: string; text?: string }>)
     // 只取文本块，其他类型内容不参与路由文本拼接。
     .filter((b) => {
@@ -69,8 +231,11 @@ function normalizeContentToText(content: unknown): string {
 function extractPromptAndSystem(messages: ChatMessage[]) {
   const lastUser = [...messages].reverse().find((m) => m.role === "user");
   const prompt = cleanOpenClawUserText(normalizeContentToText(lastUser?.content));
-  const system = messages.find((m) => m.role === "system");
-  const systemPrompt = normalizeContentToText(system?.content) || undefined;
+  const systemPrompt = messages
+    .filter((m) => m.role === "system")
+    .map((m) => normalizeContentToText(m.content))
+    .filter((text) => text.length > 0)
+    .join("\n\n");
   return { prompt, systemPrompt };
 }
 
@@ -90,10 +255,19 @@ function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function maxOutputTokens(body: Record<string, unknown>): number {
-  // 给输出 token 统一加上限，防止异常参数压垮上游。
-  const mt = body.max_tokens ?? body.max_completion_tokens;
-  if (typeof mt === "number" && mt > 0) return Math.min(mt, 128_000);
-  return 4096;
+  // 保持与 router 输入字段一致：优先 max_completion_tokens，再回退 max_tokens。
+  const mt = body.max_completion_tokens ?? body.max_tokens;
+  if (typeof mt === "number" && mt > 0) return mt;
+  return 1024;
+}
+
+function isTier(value: unknown): value is Tier {
+  return typeof value === "string" && VALID_TIERS.includes(value as Tier);
+}
+
+function defaultTier(): Tier {
+  const envTier = String(process.env.VLLM_DEFAULT_TIER ?? "MEDIUM").toUpperCase();
+  return isTier(envTier) ? envTier : "MEDIUM";
 }
 
 function tierTarget(tier: Tier): { baseUrl: string; model: string } {
@@ -127,6 +301,37 @@ function readBody(req: IncomingMessage): Promise<string> {
   });
 }
 
+function tryParseJson(rawBody: string): unknown {
+  try {
+    return JSON.parse(rawBody);
+  } catch {
+    return undefined;
+  }
+}
+
+function queueRequestLogWrite(req: IncomingMessage, rawBody: string): void {
+  const requestSnapshot = {
+    timestamp: new Date().toISOString(),
+    method: req.method ?? "",
+    url: req.url ?? "",
+    httpVersion: req.httpVersion,
+    remoteAddress: req.socket.remoteAddress ?? "",
+    headers: req.headers,
+    rawBody,
+    parsedBody: tryParseJson(rawBody),
+  };
+  const serialized = `${JSON.stringify(requestSnapshot)}\n`;
+
+  requestLogWriteQueue = requestLogWriteQueue
+    .then(async () => {
+      await mkdir(dirname(REQUEST_LOG_FILE), { recursive: true });
+      await appendFile(REQUEST_LOG_FILE, serialized, "utf8");
+    })
+    .catch((error) => {
+      console.error("[gateway] request_log_write_failed", error);
+    });
+}
+
 async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: string): Promise<void> {
   const hash = hashRequest(rawBody);
   const caller = inferCaller(req);
@@ -148,18 +353,34 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
   const { prompt, systemPrompt } = extractPromptAndSystem(messages);
-  const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const maxTokens = maxOutputTokens(body);
-  // 路由层统一产出分档结果，转发层只按结果执行。
-  const routed = routeByRules(prompt, systemPrompt, maxTokens, hasTools, DEFAULT_ROUTING_CONFIG);
+  const decision = route(prompt, systemPrompt || undefined, maxTokens, {
+    config: GATEWAY_ROUTING_CONFIG,
+    modelPricing,
+  });
+  const routedTier = isTier(decision.tier) ? decision.tier : defaultTier();
+  const usedDefaultTier = !isTier(decision.tier);
+  const routedConfidence = typeof decision.confidence === "number" ? decision.confidence : 0.5;
+  const reasoningOneLine = formatReasoningForLog(decision.reasoning).replace(/\s+/g, " ").trim();
 
   const promptLog = prompt.replace(/\s+/g, " ").trim();
   console.log(
-    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} score=${routed.rule.score.toFixed(3)} raw_tier=${routed.rule.tier ?? "AMBIGUOUS"} final_tier=${routed.tier} confidence=${routed.confidence.toFixed(3)} signals=${JSON.stringify(routed.rule.signals.join(" | "))} reason=${JSON.stringify(routed.reasoning)}`,
+    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} final_tier=${routedTier} confidence=${routedConfidence.toFixed(3)} reason=${JSON.stringify(reasoningOneLine)}`,
   );
+  const scoringDetail = buildScoringDetailLog({
+    caller,
+    promptPreview: truncateForLog(promptLog, SCORING_LOG_PROMPT_MAX),
+    prompt,
+    systemPrompt,
+    maxOutputTokens: maxTokens,
+    decision,
+    routedTier,
+    usedDefaultTier,
+  });
+  console.log("[gateway] scoring_detail", JSON.stringify(scoringDetail, null, 2));
 
   const dryRun = isGatewayDryRun();
-  const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routed.tier);
+  const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routedTier);
   if (dryRun) {
     // dry-run 只返回路由结果，不访问上游服务。
     res.writeHead(200, { "Content-Type": "application/json" });
@@ -167,9 +388,9 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       JSON.stringify({
         object: "chat.completion",
         dry_run: true,
-        tier: routed.tier,
-        confidence: routed.confidence,
-        reasoning: routed.reasoning,
+        tier: routedTier,
+        confidence: routedConfidence,
+        reasoning: decision.reasoning,
         upstream: target,
       }),
     );
@@ -178,7 +399,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const stream = body.stream === true;
   console.log(
-    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routed.tier} target=${target.model} base=${target.baseUrl} stream=${stream}`,
+    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} target=${target.model} base=${target.baseUrl} stream=${stream}`,
   );
 
   const forwardBody = {
@@ -186,7 +407,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     ...(Array.isArray(body.messages) ? { messages: sanitizeMessagesForUpstream(messages) } : {}),
     model: target.model,
   };
-  const auth = authorizationForTier(routed.tier, req);
+  const auth = authorizationForTier(routedTier, req);
   const upstream = await fetch(`${target.baseUrl}/chat/completions`, {
     method: "POST",
     headers: { "Content-Type": "application/json", ...(auth ? { Authorization: auth } : {}) },
@@ -247,7 +468,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     }
     res.end();
     console.log(
-      `[gateway] upstream_done caller=${caller} tier=${routed.tier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
+      `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} content=${JSON.stringify(fullContent || "(empty)")} tool_calls=${JSON.stringify(toolCalls)}`,
     );
     return;
   }
@@ -256,7 +477,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
   console.log(
-    `[gateway] upstream_done caller=${caller} tier=${routed.tier} model=${target.model} status=${upstream.status} body=${JSON.stringify(text)}`,
+    `[gateway] upstream_done caller=${caller} tier=${routedTier} model=${target.model} status=${upstream.status} body=${JSON.stringify(text)}`,
   );
 }
 
@@ -269,6 +490,7 @@ const server = createServer(async (req, res) => {
     }
     if (req.method === "POST" && req.url === "/v1/chat/completions") {
       const raw = await readBody(req);
+      queueRequestLogWrite(req, raw);
       await handleChat(req, res, raw);
       return;
     }
