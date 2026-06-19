@@ -1,18 +1,22 @@
 # OpenClaw Local Gateway
 
-A lightweight local gateway for OpenClaw: automatically routes requests to different models by complexity, with session-level routing, long-context governance, and lightweight session memory.
+[中文](README.zh-CN.md)
+
+A lightweight local gateway for OpenClaw: routes requests to different models by complexity, with session-level routing, long-context handling, and lightweight session memory.
+
+Requires **Node.js >= 20**.
 
 ## Why it's useful
 
-- **Multi-model intelligent routing**: automatically selects SIMPLE / MEDIUM / COMPLEX / REASONING tiers and maps them to different backends; tiering reuses `route()` weighted scoring and override rules from `@blockrun/clawrouter`.
-- **Session-level intelligent routing**: pins tier across turns, upgrades on complexity, escalates after three similar prompts; simple follow-ups can use a lighter model without downgrading session memory.
-- **Long-context governance**: truncates oversized message lists and compresses large requests so routing and upstream inputs stay aligned.
+- **Multi-model routing**: picks SIMPLE / MEDIUM / COMPLEX / REASONING tiers and maps them to backends; tiering uses weighted scoring and override rules from `@blockrun/clawrouter` `route()`.
+- **Session-level routing**: pins tier across turns, upgrades on complexity, escalates after three similar requests; simple follow-ups can use a lighter model without downgrading session memory.
+- **Long-context handling**: truncates oversized message lists and compresses large requests so routing and upstream inputs stay aligned.
 - **Lightweight session memory**: injects a session journal for recap/summary prompts and extracts key actions from assistant replies.
-- **OpenClaw-first input handling**: cleans OpenClaw metadata before routing and forwarding to avoid input mismatch.
-- **Actionable observability**: logs routing tier, confidence, weighted-score reasoning, and stream/tool-call outputs.
-- **JSON config + hot reload**: `router.config.json` unifies tier→backend mapping, keywords, and thresholds; `POST /reload` without restart.
-- **Production-friendly fallback**: primary + fallback backend chains with automatic retry on configurable HTTP status codes.
-- **Safer local usage**: blocks duplicate requests in a short window to reduce accidental repeated execution.
+- **OpenClaw input handling**: cleans OpenClaw metadata before routing and forwarding to avoid input mismatch.
+- **Routing logs**: logs tier, confidence, weighted-score reasoning, and stream/tool-call outputs.
+- **JSON config + hot reload**: `router.config.json` holds tier→backend mapping, keywords, and thresholds; `POST /reload` without restart.
+- **Fallback backends**: primary + fallback chains with automatic retry on configurable HTTP status codes.
+- **Duplicate guard**: blocks duplicate requests in a short window to reduce accidental repeated execution.
 
 ## Quick start
 
@@ -20,9 +24,11 @@ A lightweight local gateway for OpenClaw: automatically routes requests to diffe
 cd openclaw-local-gateway
 npm install
 cp router.config.example.json router.config.json   # fill backends.apiKey
-cp env.example .env                                # optional, gateway runtime knobs only
+cp env.example .env                                # required for npm run start:env
 npm run start:env
 ```
+
+Without a `.env` file, use `npm run start` instead (built-in defaults apply).
 
 OpenClaw provider `baseUrl`:
 
@@ -30,24 +36,24 @@ OpenClaw provider `baseUrl`:
 
 ## Features
 
-### Multi-model intelligent routing
+### Multi-model routing
 
 Calls `route()` on the last user message to derive a `proposed_tier` via weighted scoring and override rules, then maps it to the backend defined in `router.config.json`. Tier boundaries follow `SIMPLE → MEDIUM → COMPLEX → REASONING`; logs include `score`, boundary values, and escalation reasons.
 
-### Session-level intelligent routing
+### Session-level routing
 
-Applies in-memory session rules on top of `proposed_tier` (session ID from `x-session-id` / `x-clawrouter-session-id` when present):
+Applies in-memory session rules on top of `proposed_tier`. Session ID comes from `x-session-id` or `x-clawrouter-session-id` when present; otherwise a hash of the first user message is used.
 
 | Rule | Description |
 |------|-------------|
 | session-pinned | Keep session tier when the new tier is not higher |
 | session-upgrade | Adopt and store a higher proposed tier |
 | simple-follow-up | Route to SIMPLE without downgrading stored session tier |
-| three-strike-escalation | Bump tier one step after the same prompt fingerprint appears 3 times |
+| three-strike-escalation | Bump tier one step after the same request fingerprint appears 3 times (prompt text plus last assistant tool-call names) |
 
 State lives in memory and expires after `GATEWAY_SESSION_TTL_MS` (default 30 minutes). Observability: `x-route-tier`, `x-route-reason`, `x-route-session-id`; dry-run JSON includes `proposed_tier`, `tier`, `route_reason`.
 
-### Long-context governance
+### Long-context handling
 
 Two steps before forwarding upstream:
 
@@ -60,7 +66,7 @@ Observability: `x-route-messages-truncated`, `x-route-messages-compressed`.
 
 An in-memory session journal (same TTL as sessions, not persisted):
 
-- **Record**: after a successful upstream response, extract key actions from assistant text (e.g. `created/fixed/implemented…`), capped at 20 entries per session.
+- **Record**: after a successful upstream response, extract key actions from assistant text (English patterns such as `created`, `fixed`, `implemented`); capped at 20 entries per session.
 - **Inject**: when the last user message matches recap/summary/progress triggers, prepend the latest 8 journal entries into the system/developer message.
 
 Observability: `x-route-session-journal-injected`.
@@ -93,8 +99,8 @@ curl -X POST http://127.0.0.1:38080/reload
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `GATEWAY_PORT` | Local gateway port | `38080` |
-| `GATEWAY_DRY_RUN` | If `1/true`, return routing result without upstream calls | — |
-| `GATEWAY_DEDUP_WINDOW_MS` | Duplicate-request guard window | — |
+| `GATEWAY_DRY_RUN` | If `1/true`, return routing result without upstream calls | off (`0`) |
+| `GATEWAY_DEDUP_WINDOW_MS` | Duplicate-request guard window (ms) | `5000` |
 | `GATEWAY_SESSION_TTL_MS` | In-memory session TTL | `1800000` (30 min) |
 | `GATEWAY_MAX_MESSAGES` | Message list cap | `60` |
 | `GATEWAY_COMPRESSION_THRESHOLD_KB` | Compress when body exceeds this size (KB) | `180` |
@@ -103,6 +109,7 @@ curl -X POST http://127.0.0.1:38080/reload
 
 ## Endpoints
 
-- `GET /health`
-- `POST /reload` (hot-reload config, clears in-memory sessions)
-- `POST /v1/chat/completions`
+- `GET /health`: check gateway and backend connectivity; return config source and health status
+- `GET /v1/models`: list configured backend models (OpenAI-compatible)
+- `POST /reload`: hot-reload config; clear in-memory sessions and journals
+- `POST /v1/chat/completions`: accept chat requests, route by tier, and forward upstream
