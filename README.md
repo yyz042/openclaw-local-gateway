@@ -9,6 +9,7 @@ A lightweight local gateway for OpenClaw that borrows the routing core of `@bloc
 - **Actionable observability**: logs routing tier, confidence, weighted-score reasoning, and stream/tool-call outputs for postmortem analysis.
 - **Safer local usage**: blocks duplicate requests in a short window to reduce accidental repeated execution.
 - **Session-aware routing**: keeps tier stable across turns, upgrades when complexity rises, and escalates after repeated similar prompts.
+- **Lightweight session memory**: injects an in-memory session journal for recap/summary prompts and records key actions from assistant replies.
 - **Production-friendly fallback behavior**: tier-specific endpoint/model/api-key mapping with sensible default fallbacks.
 
 ## ClawRouter routing ideas used here
@@ -80,22 +81,34 @@ curl -s "$BASE" -H "x-session-id: $SESSION" -H "Content-Type: application/json" 
 
 Expect the first call `route_reason=new-session` and the second `simple-follow-up` or `session-pinned` depending on the proposed tier.
 
+## Lightweight session memory
+
+An in-memory **session journal** (same TTL as `GATEWAY_SESSION_TTL_MS`, not persisted to disk):
+
+1. **Record**: after a successful upstream response, extract key actions from assistant text via regex (e.g. `created/fixed/implemented…` or Chinese `创建/修复/实现…`), up to 4 entries per turn, capped at 20 per session.
+2. **Inject**: when the last user message matches recap/summary/progress triggers (e.g. `summarize`, `recap`, `总结`, `刚才`, `进展`, `继续`), prepend the latest 8 journal entries as `[Session Memory - Key Actions]` into the `system`/`developer` message (or create a new `system` message).
+3. **Timing**: injection runs after OpenClaw cleaning and context governance, before upstream forwarding; recording only happens on real upstream calls (not dry-run).
+
+**Response signals**: header `x-route-session-journal-injected`; log `[gateway] session_journal injected …`.
+
 ## What it removes
 
 - x402 payments
 - wallet/auth lifecycle
 - partner/provider plugin system
-- durable session store / session journal (only lightweight in-memory session routing is kept)
+- durable session store (only lightweight in-memory session routing and in-memory session journal are kept)
 
 ## Request flow
 
 1. Accept OpenAI-compatible request at `POST /v1/chat/completions`.
 2. Clean OpenClaw user text (`[message_id: ...]`, timestamp wrappers).
-3. Route the last user message to a proposed tier (`SIMPLE/MEDIUM/COMPLEX/REASONING`) using ClawRouter logic.
-4. Apply session-level rules (pin, upgrade, SIMPLE follow-up, three-strike escalation).
-5. Resolve upstream target (`VLLM_<TIER>_*` or default fallback).
-6. Forward request and stream response back (SSE and tool-call chunks preserved).
-7. Emit request/routing/upstream completion logs (including `route_reason` and session fields).
+3. Govern long context (truncate/compress messages when needed).
+4. Route the last user message to a proposed tier (`SIMPLE/MEDIUM/COMPLEX/REASONING`) using ClawRouter logic.
+5. Apply session-level rules (pin, upgrade, SIMPLE follow-up, three-strike escalation).
+6. Inject session journal when the prompt asks for recap/summary/progress.
+7. Resolve upstream target (`VLLM_<TIER>_*` or default fallback).
+8. Forward request and stream response back (SSE and tool-call chunks preserved); record key actions from assistant replies.
+9. Emit request/routing/upstream completion logs (including `route_reason` and session fields).
 
 ## Quick start
 
