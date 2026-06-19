@@ -9,6 +9,7 @@ import {
   type RoutingConfig,
   type RoutingDecision,
 } from "@blockrun/clawrouter";
+import { governMessages, type ContextGovernanceMeta } from "./context-governance.js";
 
 /** 覆盖 @blockrun/clawrouter 默认的 scoring.confidenceThreshold（包内约 0.7）。 */
 const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
@@ -352,6 +353,7 @@ function setRouteResponseHeaders(
     routeReason: SessionRouteReason;
     sessionId: string | null;
     targetModel: string;
+    contextGovernance?: ContextGovernanceMeta;
   },
 ): void {
   res.setHeader("x-route-tier", params.routedTier);
@@ -360,6 +362,8 @@ function setRouteResponseHeaders(
   res.setHeader("x-route-reason", params.routeReason);
   res.setHeader("x-upstream-model", params.targetModel);
   if (params.sessionId) res.setHeader("x-route-session-id", params.sessionId);
+  if (params.contextGovernance?.wasTruncated) res.setHeader("x-route-messages-truncated", "true");
+  if (params.contextGovernance?.wasCompressed) res.setHeader("x-route-messages-compressed", "true");
 }
 
 function isGatewayDryRun(): boolean {
@@ -541,8 +545,21 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     return;
   }
 
-  const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
+  const rawMessages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
+  const sanitizedMessages = sanitizeMessagesForUpstream(rawMessages);
+  const { messages: governedMessages, meta: contextGovernance } = governMessages(sanitizedMessages);
+  if (Array.isArray(body.messages)) body.messages = governedMessages;
+
+  const messages = governedMessages as ChatMessage[];
   const { prompt, systemPrompt } = extractPromptAndSystem(messages);
+  if (contextGovernance.wasTruncated) {
+    console.log(
+      `[gateway] context_governance truncated ${contextGovernance.originalCount} -> ${contextGovernance.truncatedCount}`,
+    );
+  }
+  if (contextGovernance.wasCompressed) {
+    console.log(`[gateway] context_governance compressed chars_saved=${contextGovernance.charsSaved}`);
+  }
   const maxTokens = maxOutputTokens(body);
   const decision = route(prompt, systemPrompt || undefined, maxTokens, {
     config: GATEWAY_ROUTING_CONFIG,
@@ -587,6 +604,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       routeReason,
       sessionId,
       targetModel: target.model,
+      contextGovernance,
     });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
@@ -600,6 +618,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
         confidence: routedConfidence,
         reasoning: decision.reasoning,
         upstream: target,
+        context_governance: contextGovernance,
       }),
     );
     return;
@@ -612,7 +631,6 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const forwardBody = {
     ...body,
-    ...(Array.isArray(body.messages) ? { messages: sanitizeMessagesForUpstream(messages) } : {}),
     model: target.model,
   };
   const auth = authorizationForTier(routedTier, req);
@@ -630,6 +648,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
       routeReason,
       sessionId,
       targetModel: target.model,
+      contextGovernance,
     });
     res.writeHead(upstream.status, {
       "Content-Type": upstream.headers.get("content-type") ?? "text/event-stream",
@@ -697,6 +716,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     routeReason,
     sessionId,
     targetModel: target.model,
+    contextGovernance,
   });
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
