@@ -22,8 +22,28 @@ const GATEWAY_ROUTING_CONFIG: RoutingConfig = {
 type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 const DEDUP_WINDOW_MS = Number(process.env.GATEWAY_DEDUP_WINDOW_MS ?? "5000");
+const SESSION_TTL_MS = Number(process.env.GATEWAY_SESSION_TTL_MS ?? String(30 * 60 * 1000));
 const REQUEST_LOG_FILE = resolve(process.env.GATEWAY_REQUEST_LOG_FILE ?? "./logs/gateway-requests.json");
 const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+const TIER_ORDER: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
+
+type SessionRouteReason =
+  | "no-session"
+  | "new-session"
+  | "session-pinned"
+  | "session-upgrade"
+  | "simple-follow-up"
+  | "three-strike-escalation";
+
+type SessionState = {
+  tier: Tier;
+  requestHashes: Map<string, number>;
+  createdAt: number;
+  updatedAt: number;
+};
+
+/** 会话级路由状态：固定档位、复杂升档、三次相似请求升档。 */
+const sessions = new Map<string, SessionState>();
 
 const SCORING_LOG_PROMPT_MAX = 480;
 
@@ -72,10 +92,14 @@ function buildScoringDetailLog(params: {
   systemPrompt: string;
   maxOutputTokens: number;
   decision: RoutingDecision;
+  proposedTier: Tier;
   routedTier: Tier;
   usedDefaultTier: boolean;
+  sessionId: string | null;
+  routeReason: SessionRouteReason;
 }): Record<string, unknown> {
-  const { decision, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens } = params;
+  const { decision, proposedTier, routedTier, usedDefaultTier, prompt, systemPrompt, maxOutputTokens, sessionId, routeReason } =
+    params;
   const reasoning = decision.reasoning;
   const weightedScore = parseWeightedScoreFromReasoning(reasoning);
   const boundaries = GATEWAY_ROUTING_CONFIG.scoring.tierBoundaries;
@@ -125,6 +149,15 @@ function buildScoringDetailLog(params: {
       `系统提示含 json/structured/schema 线索；未出现升档说明当前 tier 已不低于 structuredOutputMinTier=${overrides.structuredOutputMinTier}。`,
     );
   }
+  if (routeReason === "session-pinned") {
+    explanations.push(`会话 ${sessionId} 已固定档位 ${routedTier}，本次路由分档 ${proposedTier} 未超过已固定档位，沿用会话档位。`);
+  } else if (routeReason === "session-upgrade") {
+    explanations.push(`会话 ${sessionId} 检测到更高复杂度（${proposedTier} > 已固定档位），升档至 ${routedTier}。`);
+  } else if (routeReason === "simple-follow-up") {
+    explanations.push(`会话 ${sessionId} 的简单追问走 SIMPLE 档，但会话记忆档位保持 ${routedTier}。`);
+  } else if (routeReason === "three-strike-escalation") {
+    explanations.push(`会话 ${sessionId} 内相似请求累计 ≥3 次，升档至 ${routedTier}。`);
+  }
 
   return {
     caller: params.caller,
@@ -136,8 +169,14 @@ function buildScoringDetailLog(params: {
     tier_from_weighted_score_only: scoreOnlyTier ?? null,
     reasoning_keyword_hits: reasoningKw.length,
     reasoning_keywords_matched: reasoningKw.slice(0, 30),
+    session: {
+      session_id: sessionId,
+      route_reason: routeReason,
+      proposed_tier: proposedTier,
+    },
     routing: {
       raw_tier: decision.tier,
+      proposed_tier: proposedTier,
       final_tier: routedTier,
       gateway_normalized_tier: usedDefaultTier,
       confidence: decision.confidence,
@@ -170,7 +209,158 @@ const modelPricing = new Map(
   ]),
 );
 
-type ChatMessage = { role?: string; content?: unknown };
+type ChatMessage = {
+  role?: string;
+  content?: unknown;
+  tool_calls?: Array<{ function?: { name?: string } }>;
+};
+
+function hashText(text: string, length = 12): string {
+  return createHash("sha256").update(text).digest("hex").slice(0, length);
+}
+
+function getRequestHeader(req: IncomingMessage, name: string): string | undefined {
+  const value = req.headers[name] ?? req.headers[name.toLowerCase()];
+  if (Array.isArray(value)) return value[0];
+  return typeof value === "string" ? value : undefined;
+}
+
+function getTierRank(tier: Tier): number {
+  const idx = TIER_ORDER.indexOf(tier);
+  return idx >= 0 ? idx : TIER_ORDER.indexOf("MEDIUM");
+}
+
+function nextTier(tier: Tier): Tier {
+  const currentRank = getTierRank(tier);
+  return TIER_ORDER[Math.min(TIER_ORDER.length - 1, currentRank + 1)] ?? tier;
+}
+
+/** 从请求头或首条用户消息推导会话 ID。 */
+function getSessionId(req: IncomingMessage, messages: ChatMessage[]): string | null {
+  const explicit = getRequestHeader(req, "x-session-id") ?? getRequestHeader(req, "x-clawrouter-session-id");
+  if (explicit?.trim()) return explicit.trim();
+
+  const firstUser = messages.find((m) => m.role === "user");
+  if (!firstUser) return null;
+  return hashText(cleanOpenClawUserText(normalizeContentToText(firstUser.content)), 16);
+}
+
+/** 对 prompt + 最近 assistant tool_calls 做指纹，用于三次相似请求升档。 */
+function hashRequestContent(prompt: string, body: Record<string, unknown>): string {
+  const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
+  const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+  const toolNames = Array.isArray(lastAssistant?.tool_calls)
+    ? lastAssistant.tool_calls
+        .map((tc) => tc.function?.name)
+        .filter((name): name is string => typeof name === "string" && name.length > 0)
+        .sort()
+        .join(",")
+    : "";
+  return hashText(`${prompt.replace(/\s+/g, " ").trim().slice(0, 500)}|tools:${toolNames}`, 12);
+}
+
+function cleanupSessions(): void {
+  const cutoff = Date.now() - SESSION_TTL_MS;
+  for (const [sessionId, session] of sessions.entries()) {
+    if (session.updatedAt < cutoff) sessions.delete(sessionId);
+  }
+}
+
+setInterval(cleanupSessions, Math.min(5 * 60 * 1000, SESSION_TTL_MS)).unref();
+
+/**
+ * 会话级智能路由：
+ * - 同会话固定档位（pinning），避免多轮对话频繁换模型；
+ * - 后续请求更复杂时升档；
+ * - SIMPLE 追问可走轻量档但不降低会话记忆档位；
+ * - 同会话内相似请求累计 3 次则再升一档。
+ */
+function applySessionRouting(
+  sessionId: string | null,
+  proposedTier: Tier,
+  prompt: string,
+  body: Record<string, unknown>,
+): { tier: Tier; routeReason: SessionRouteReason } {
+  if (!sessionId) {
+    return { tier: proposedTier, routeReason: "no-session" };
+  }
+
+  const now = Date.now();
+  const existing = sessions.get(sessionId);
+  let selectedTier = proposedTier;
+  let storedTier = proposedTier;
+  let routeReason: SessionRouteReason = "new-session";
+
+  if (existing) {
+    const proposedRank = getTierRank(proposedTier);
+    const pinnedRank = getTierRank(existing.tier);
+
+    if (proposedRank > pinnedRank) {
+      selectedTier = proposedTier;
+      storedTier = proposedTier;
+      routeReason = "session-upgrade";
+    } else if (proposedTier === "SIMPLE") {
+      selectedTier = proposedTier;
+      storedTier = existing.tier;
+      routeReason = "simple-follow-up";
+    } else {
+      selectedTier = existing.tier;
+      storedTier = existing.tier;
+      routeReason = "session-pinned";
+    }
+  }
+
+  const session: SessionState = existing ?? {
+    tier: selectedTier,
+    requestHashes: new Map(),
+    createdAt: now,
+    updatedAt: now,
+  };
+
+  const requestHash = hashRequestContent(prompt, body);
+  const hashCount = (session.requestHashes.get(requestHash) ?? 0) + 1;
+  session.requestHashes.set(requestHash, hashCount);
+
+  if (session.requestHashes.size > 20) {
+    const oldest = session.requestHashes.keys().next().value;
+    if (oldest !== undefined) session.requestHashes.delete(oldest);
+  }
+
+  if (hashCount >= 3) {
+    const escalatedTier = nextTier(selectedTier);
+    if (getTierRank(escalatedTier) > getTierRank(selectedTier)) {
+      selectedTier = escalatedTier;
+      storedTier = escalatedTier;
+      routeReason = "three-strike-escalation";
+      session.requestHashes.set(requestHash, 0);
+    }
+  }
+
+  session.tier = storedTier;
+  session.updatedAt = now;
+  sessions.set(sessionId, session);
+
+  return { tier: selectedTier, routeReason };
+}
+
+function setRouteResponseHeaders(
+  res: ServerResponse,
+  params: {
+    routedTier: Tier;
+    routedConfidence: number;
+    decision: RoutingDecision;
+    routeReason: SessionRouteReason;
+    sessionId: string | null;
+    targetModel: string;
+  },
+): void {
+  res.setHeader("x-route-tier", params.routedTier);
+  res.setHeader("x-route-confidence", params.routedConfidence.toFixed(3));
+  res.setHeader("x-route-method", String(params.decision.method ?? ""));
+  res.setHeader("x-route-reason", params.routeReason);
+  res.setHeader("x-upstream-model", params.targetModel);
+  if (params.sessionId) res.setHeader("x-route-session-id", params.sessionId);
+}
 
 function isGatewayDryRun(): boolean {
   return process.env.GATEWAY_DRY_RUN === "1" || process.env.GATEWAY_DRY_RUN === "true";
@@ -358,14 +548,18 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     config: GATEWAY_ROUTING_CONFIG,
     modelPricing,
   });
-  const routedTier = isTier(decision.tier) ? decision.tier : defaultTier();
+  const proposedTier = isTier(decision.tier) ? decision.tier : defaultTier();
   const usedDefaultTier = !isTier(decision.tier);
+  const sessionId = getSessionId(req, messages);
+  const sessionRoute = applySessionRouting(sessionId, proposedTier, prompt, body);
+  const routedTier = sessionRoute.tier;
+  const routeReason = sessionRoute.routeReason;
   const routedConfidence = typeof decision.confidence === "number" ? decision.confidence : 0.5;
   const reasoningOneLine = formatReasoningForLog(decision.reasoning).replace(/\s+/g, " ").trim();
 
   const promptLog = prompt.replace(/\s+/g, " ").trim();
   console.log(
-    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} final_tier=${routedTier} confidence=${routedConfidence.toFixed(3)} reason=${JSON.stringify(reasoningOneLine)}`,
+    `[gateway] scoring caller=${caller} prompt=${JSON.stringify(promptLog)} raw_tier=${decision.tier ?? "AMBIGUOUS"} proposed_tier=${proposedTier} final_tier=${routedTier} route_reason=${routeReason} session=${sessionId ?? "none"} confidence=${routedConfidence.toFixed(3)} reason=${JSON.stringify(reasoningOneLine)}`,
   );
   const scoringDetail = buildScoringDetailLog({
     caller,
@@ -374,8 +568,11 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     systemPrompt,
     maxOutputTokens: maxTokens,
     decision,
+    proposedTier,
     routedTier,
     usedDefaultTier,
+    sessionId,
+    routeReason,
   });
   console.log("[gateway] scoring_detail", JSON.stringify(scoringDetail, null, 2));
 
@@ -383,12 +580,23 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   const target = dryRun ? { baseUrl: "(unset)", model: "(unset)" } : tierTarget(routedTier);
   if (dryRun) {
     // dry-run 只返回路由结果，不访问上游服务。
+    setRouteResponseHeaders(res, {
+      routedTier,
+      routedConfidence,
+      decision,
+      routeReason,
+      sessionId,
+      targetModel: target.model,
+    });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(
       JSON.stringify({
         object: "chat.completion",
         dry_run: true,
         tier: routedTier,
+        proposed_tier: proposedTier,
+        route_reason: routeReason,
+        session_id: sessionId,
         confidence: routedConfidence,
         reasoning: decision.reasoning,
         upstream: target,
@@ -399,7 +607,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
 
   const stream = body.stream === true;
   console.log(
-    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} target=${target.model} base=${target.baseUrl} stream=${stream}`,
+    `[gateway] caller=${caller} prompt=${JSON.stringify(promptLog)} tier=${routedTier} route_reason=${routeReason} session=${sessionId ?? "none"} target=${target.model} base=${target.baseUrl} stream=${stream}`,
   );
 
   const forwardBody = {
@@ -415,6 +623,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   });
 
   if (stream && upstream.ok && upstream.body) {
+    setRouteResponseHeaders(res, {
+      routedTier,
+      routedConfidence,
+      decision,
+      routeReason,
+      sessionId,
+      targetModel: target.model,
+    });
     res.writeHead(upstream.status, {
       "Content-Type": upstream.headers.get("content-type") ?? "text/event-stream",
       "Cache-Control": "no-cache",
@@ -474,6 +690,14 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   }
 
   const text = await upstream.text();
+  setRouteResponseHeaders(res, {
+    routedTier,
+    routedConfidence,
+    decision,
+    routeReason,
+    sessionId,
+    targetModel: target.model,
+  });
   res.writeHead(upstream.status, { "Content-Type": "application/json" });
   res.end(text);
   console.log(
