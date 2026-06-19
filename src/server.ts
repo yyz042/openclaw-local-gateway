@@ -46,7 +46,7 @@ type SessionState = {
   updatedAt: number;
 };
 
-/** 会话级路由状态：固定档位、复杂升档、三次相似请求升档。 */
+/** In-memory session routing: tier pinning, complexity upgrades, three-strike escalation. */
 const sessions = new Map<string, SessionState>();
 
 const SCORING_LOG_PROMPT_MAX = 480;
@@ -54,14 +54,14 @@ const SCORING_LOG_PROMPT_MAX = 480;
 function truncateForLog(text: string, maxChars: number): string {
   const t = text.replace(/\s+/g, " ").trim();
   if (t.length <= maxChars) return t;
-  return `${t.slice(0, maxChars)}…(共 ${t.length} 字)`;
+  return `${t.slice(0, maxChars)}…(${t.length} chars total)`;
 }
 
 function formatReasoningForLog(reasoning: string): string {
-  return reasoning.length > 4000 ? `${reasoning.slice(0, 4000)}…(已截断)` : reasoning;
+  return reasoning.length > 4000 ? `${reasoning.slice(0, 4000)}…(truncated)` : reasoning;
 }
 
-/** 与 clawrouter 规则路由一致：从 reasoning 前缀解析加权分。 */
+/** Parse weighted score from the reasoning prefix (matches clawrouter rule routing). */
 function parseWeightedScoreFromReasoning(reasoning: string): number | undefined {
   const m = reasoning.match(/^score=(-?\d+(?:\.\d+)?)/);
   if (!m) return undefined;
@@ -69,13 +69,13 @@ function parseWeightedScoreFromReasoning(reasoning: string): number | undefined 
   return Number.isFinite(n) ? n : undefined;
 }
 
-/** 与 classifyByRules 一致：仅对用户 prompt 小写文本匹配推理关键词。 */
+/** Match reasoning keywords against the lowercased user prompt (same as classifyByRules). */
 function collectReasoningKeywordMatches(prompt: string, keywords: readonly string[]): string[] {
   const userText = prompt.toLowerCase();
   return keywords.filter((kw) => userText.includes(kw.toLowerCase()));
 }
 
-/** 仅按加权分与 tierBoundaries 映射档位（不含「≥2 推理词」等覆盖规则）。 */
+/** Map tier from weighted score and tierBoundaries only (no override rules such as ≥2 reasoning keywords). */
 function tierFromWeightedScoreOnly(score: number, routingConfig: RoutingConfig): Tier {
   const { simpleMedium, mediumComplex, complexReasoning } = routingConfig.scoring.tierBoundaries;
   if (score < simpleMedium) return "SIMPLE";
@@ -132,47 +132,47 @@ function buildScoringDetailLog(params: {
   const explanations: string[] = [];
   if (usedDefaultTier) {
     explanations.push(
-      `网关将路由层返回的档位「${String(decision.tier ?? "undefined")}」规范化为 policy.defaultTier（当前生效：${proposedTier}）。`,
+      `Gateway normalized router tier "${String(decision.tier ?? "undefined")}" to policy.defaultTier (effective: ${proposedTier}).`,
     );
   }
   if (forcedComplexByTokens) {
     explanations.push(
-      `估算输入约 ${estimatedTokens} tokens（超过 maxTokensForceComplex=${overrides.maxTokensForceComplex}），与 @blockrun/clawrouter 一致：强制 COMPLEX。`,
+      `Estimated input ~${estimatedTokens} tokens (exceeds maxTokensForceComplex=${overrides.maxTokensForceComplex}); forced COMPLEX per @blockrun/clawrouter.`,
     );
   }
   if (!forcedComplexByTokens && reasoningKeywordTierBoost && decision.tier === "REASONING") {
     explanations.push(
-      `命中 ${reasoningKw.length} 个推理类关键词（≥2 即强制 REASONING），可覆盖仅凭分数轴得到的档位；若加权分仍低于 complexReasoning(${boundaries.complexReasoning})，属于预期行为。`,
+      `Matched ${reasoningKw.length} reasoning keywords (≥2 forces REASONING), overriding score-only tier; score below complexReasoning(${boundaries.complexReasoning}) is expected.`,
     );
   }
   if (ambiguousBranch) {
     explanations.push(
-      `规则置信度低于 confidenceThreshold=${routingConfig.scoring.confidenceThreshold}，档位视为模糊，采用 ambiguousDefaultTier=${overrides.ambiguousDefaultTier}。`,
+      `Rule confidence below confidenceThreshold=${routingConfig.scoring.confidenceThreshold}; tier treated as ambiguous, using ambiguousDefaultTier=${overrides.ambiguousDefaultTier}.`,
     );
   }
   if (weightedScore !== undefined && scoreOnlyTier !== undefined) {
     explanations.push(
-      `加权分 ${weightedScore.toFixed(3)} 与阈值 simpleMedium=${boundaries.simpleMedium}、mediumComplex=${boundaries.mediumComplex}、complexReasoning=${boundaries.complexReasoning} 对比 → 纯分数轴为 ${scoreOnlyTier}；clawrouter 最终 tier=${decision.tier}。`,
+      `Weighted score ${weightedScore.toFixed(3)} vs simpleMedium=${boundaries.simpleMedium}, mediumComplex=${boundaries.mediumComplex}, complexReasoning=${boundaries.complexReasoning} → score-only tier ${scoreOnlyTier}; clawrouter final tier=${decision.tier}.`,
     );
     if (decision.tier !== scoreOnlyTier && !reasoningKeywordTierBoost && !ambiguousBranch && !forcedComplexByTokens) {
-      explanations.push("若档位与分数轴不一致，请核对 reasoning 后缀（例如 structured output 升档）。");
+      explanations.push("If tier differs from score-only tier, check the reasoning suffix (e.g. structured output upgrade).");
     }
   }
   if (structuredUpgrade) {
-    explanations.push("已触发 structured output 升档（reasoning 中含 upgraded … structured output）。");
+    explanations.push("Structured output upgrade triggered (reasoning contains upgraded … structured output).");
   } else if (hasStructuredSystemHint) {
     explanations.push(
-      `系统提示含 json/structured/schema 线索；未出现升档说明当前 tier 已不低于 structuredOutputMinTier=${overrides.structuredOutputMinTier}。`,
+      `System prompt hints at json/structured/schema; no upgrade means current tier is already ≥ structuredOutputMinTier=${overrides.structuredOutputMinTier}.`,
     );
   }
   if (routeReason === "session-pinned") {
-    explanations.push(`会话 ${sessionId} 已固定档位 ${routedTier}，本次路由分档 ${proposedTier} 未超过已固定档位，沿用会话档位。`);
+    explanations.push(`Session ${sessionId} pinned at ${routedTier}; proposed ${proposedTier} did not exceed pinned tier.`);
   } else if (routeReason === "session-upgrade") {
-    explanations.push(`会话 ${sessionId} 检测到更高复杂度（${proposedTier} > 已固定档位），升档至 ${routedTier}。`);
+    explanations.push(`Session ${sessionId} upgraded due to higher complexity (${proposedTier} > pinned tier) → ${routedTier}.`);
   } else if (routeReason === "simple-follow-up") {
-    explanations.push(`会话 ${sessionId} 的简单追问走 SIMPLE 档，但会话记忆档位保持 ${routedTier}。`);
+    explanations.push(`Session ${sessionId} simple follow-up uses SIMPLE tier; session memory tier stays ${routedTier}.`);
   } else if (routeReason === "three-strike-escalation") {
-    explanations.push(`会话 ${sessionId} 内相似请求累计 ≥3 次，升档至 ${routedTier}。`);
+    explanations.push(`Session ${sessionId} saw ≥3 similar requests; escalated to ${routedTier}.`);
   }
 
   return {
@@ -211,11 +211,11 @@ function buildScoringDetailLog(params: {
       structured_output_upgrade: structuredUpgrade,
       system_has_structured_hint: hasStructuredSystemHint,
     },
-    explanations_zh: explanations,
+    explanations,
     reasoning_full: formatReasoningForLog(reasoning),
   };
 }
-// 只保留短时间内的请求指纹，用来拦截重复请求。
+// Short-lived request fingerprints to block duplicate submissions.
 const recentRequests = new Map<string, number>();
 let requestLogWriteQueue: Promise<void> = Promise.resolve();
 
@@ -245,7 +245,7 @@ function nextTier(tier: Tier): Tier {
   return TIER_ORDER[Math.min(TIER_ORDER.length - 1, currentRank + 1)] ?? tier;
 }
 
-/** 从请求头或首条用户消息推导会话 ID。 */
+/** Derive session ID from headers or a hash of the first user message. */
 function getSessionId(req: IncomingMessage, messages: ChatMessage[]): string | null {
   const explicit = getRequestHeader(req, "x-session-id") ?? getRequestHeader(req, "x-clawrouter-session-id");
   if (explicit?.trim()) return explicit.trim();
@@ -255,7 +255,7 @@ function getSessionId(req: IncomingMessage, messages: ChatMessage[]): string | n
   return hashText(cleanOpenClawUserText(normalizeContentToText(firstUser.content)), 16);
 }
 
-/** 对 prompt + 最近 assistant tool_calls 做指纹，用于三次相似请求升档。 */
+/** Fingerprint prompt + recent assistant tool_calls for three-strike tier escalation. */
 function hashRequestContent(prompt: string, body: Record<string, unknown>): string {
   const messages = Array.isArray(body.messages) ? (body.messages as ChatMessage[]) : [];
   const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
@@ -282,11 +282,11 @@ function cleanupSessions(): void {
 setInterval(cleanupSessions, Math.min(5 * 60 * 1000, SESSION_TTL_MS)).unref();
 
 /**
- * 会话级智能路由：
- * - 同会话固定档位（pinning），避免多轮对话频繁换模型；
- * - 后续请求更复杂时升档；
- * - SIMPLE 追问可走轻量档但不降低会话记忆档位；
- * - 同会话内相似请求累计 3 次则再升一档。
+ * Session-aware routing:
+ * - Pin tier per session to avoid model churn across turns;
+ * - Upgrade when a later request is more complex;
+ * - SIMPLE follow-ups may use the light tier without lowering session memory;
+ * - Escalate one tier after 3 similar requests in the same session.
  */
 function applySessionRouting(
   sessionId: string | null,
@@ -413,7 +413,7 @@ function isDuplicateWithinWindow(requestHash: string): boolean {
 }
 
 function cleanOpenClawUserText(text: string): string {
-  // 去掉 OpenClaw 附带的元信息，尽量保留用户原始问题。
+  // Strip OpenClaw metadata wrappers; keep the user's original question.
   return text
     .split("\n")
     .map((line) => line.trim())
@@ -431,7 +431,7 @@ function normalizeContentToText(content: unknown): string {
   if (typeof content === "string") return content;
   if (!Array.isArray(content)) return content == null ? "" : String(content);
   return (content as Array<{ type?: string; text?: string }>)
-    // 只取文本块，其他类型内容不参与路由文本拼接。
+    // Keep text parts only; other content types are excluded from routing text.
     .filter((b) => {
       if (typeof b?.text !== "string" || b.text.length === 0) return false;
       const t = String(b.type ?? "").toLowerCase();
@@ -453,7 +453,7 @@ function extractPromptAndSystem(messages: ChatMessage[]) {
 }
 
 function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
-  // 转发给上游前也做同样清洗，避免路由输入和实际输入不一致。
+  // Apply the same cleaning before upstream forwarding so routing input matches upstream input.
   return messages.map((m) => {
     if (m.role !== "user") return m;
     if (typeof m.content === "string") return { ...m, content: cleanOpenClawUserText(m.content) };
@@ -468,7 +468,7 @@ function sanitizeMessagesForUpstream(messages: ChatMessage[]): ChatMessage[] {
 }
 
 function maxOutputTokens(body: Record<string, unknown>): number {
-  // 保持与 router 输入字段一致：优先 max_completion_tokens，再回退 max_tokens。
+  // Match router input: prefer max_completion_tokens, then fall back to max_tokens.
   const mt = body.max_completion_tokens ?? body.max_tokens;
   if (typeof mt === "number" && mt > 0) return mt;
   return 1024;
@@ -600,7 +600,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
         backendId: backendIds[0]!,
       };
   if (dryRun) {
-    // dry-run 只返回路由结果，不访问上游服务。
+    // Dry-run returns routing metadata only; no upstream call.
     setRouteResponseHeaders(res, {
       routedTier,
       routedConfidence,
@@ -682,7 +682,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
     const decoder = new TextDecoder();
     let sseBuffer = "";
     let fullContent = "";
-    // 聚合流式内容，结束时可以打完整日志。
+    // Aggregate streamed content for a complete upstream_done log.
     const toolCalls: Array<{ id?: string; name?: string; arguments?: string }> = [];
     for (;;) {
       const { done, value } = await reader.read();
@@ -757,7 +757,7 @@ async function handleChat(req: IncomingMessage, res: ServerResponse, rawBody: st
   );
 }
 
-/** 按 fallback 链依次请求上游，遇可重试状态码则切换下一后端。 */
+/** Try upstream backends in fallback order; switch on retryable status codes. */
 async function callUpstreamWithFallback(params: {
   req: IncomingMessage;
   tier: Tier;
@@ -790,7 +790,7 @@ async function callUpstreamWithFallback(params: {
   }
 
   if (!lastResponse) {
-    throw new Error("无可用上游后端响应");
+    throw new Error("No upstream backend response available");
   }
   return lastResponse;
 }
@@ -861,8 +861,8 @@ server.listen(port, "127.0.0.1", () => {
   const configLabel =
     configState.source === "file"
       ? `router.config.json (${configState.configPath})`
-      : "环境变量 VLLM_*（未找到 router.config.json）";
+      : "VLLM_* env vars (router.config.json not found)";
   console.log(`[openclaw-local-gateway] listening http://127.0.0.1:${port}/v1/chat/completions`);
-  console.log(`[openclaw-local-gateway] 可观测接口: GET /health, GET /v1/models, POST /reload`);
-  console.log(`[openclaw-local-gateway] 配置来源: ${configLabel}`);
+  console.log(`[openclaw-local-gateway] observability: GET /health, GET /v1/models, POST /reload`);
+  console.log(`[openclaw-local-gateway] config source: ${configLabel}`);
 });

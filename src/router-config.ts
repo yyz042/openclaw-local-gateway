@@ -11,7 +11,7 @@ export type Tier = "SIMPLE" | "MEDIUM" | "COMPLEX" | "REASONING";
 
 export const VALID_TIERS: Tier[] = ["SIMPLE", "MEDIUM", "COMPLEX", "REASONING"];
 
-/** 单个上游后端定义（URL / 模型 / 鉴权 / 请求参数覆盖）。 */
+/** Single upstream backend (URL, model, auth, request param overrides). */
 export type BackendConfig = {
   baseUrl: string;
   model: string;
@@ -22,7 +22,7 @@ export type BackendConfig = {
   outputPrice?: number;
 };
 
-/** 档位到后端的 primary + fallback 链。 */
+/** Tier → primary backend plus optional fallback chain. */
 export type TierBackendConfig = {
   primary: string;
   fallback?: string[];
@@ -34,7 +34,7 @@ export type RouterPolicy = {
   retryStatuses: number[];
 };
 
-/** router.config.json 顶层结构。 */
+/** Top-level router.config.json shape. */
 export type RawRouterConfig = {
   policy?: Partial<RouterPolicy>;
   routing?: {
@@ -70,7 +70,7 @@ function isTier(value: unknown): value is Tier {
   return typeof value === "string" && VALID_TIERS.includes(value as Tier);
 }
 
-/** 浅层递归合并，数组与标量以 patch 为准。 */
+/** Shallow recursive merge; arrays and scalars are replaced by patch values. */
 function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown> | undefined): Record<string, unknown> {
   if (!patch) return base;
   const out: Record<string, unknown> = { ...base };
@@ -92,10 +92,10 @@ function deepMerge(base: Record<string, unknown>, patch: Record<string, unknown>
   return out;
 }
 
-/** 将 JSON 中的 routing 段映射为 @blockrun/clawrouter 的 RoutingConfig。 */
+/** Map the routing section from JSON to @blockrun/clawrouter RoutingConfig. */
 function buildRoutingConfigFromRaw(routing?: RawRouterConfig["routing"]): RoutingConfig {
   const config = structuredClone(DEFAULT_ROUTING_CONFIG);
-  // 网关默认置信度阈值（低于 clawrouter 包内默认值，便于本地部署）
+  // Lower default confidence threshold than clawrouter (better for local deployments)
   config.scoring.confidenceThreshold = 0.55;
 
   const scoring = routing?.scoring;
@@ -111,7 +111,7 @@ function buildRoutingConfigFromRaw(routing?: RawRouterConfig["routing"]): Routin
     config.overrides.maxTokensForceComplex = routing.overrides.largeContextTokens;
   }
 
-  // 将 router.config.json 的 tier→backend 链同步到 clawrouter，使后端 ID 与自定义定价参与 route() 成本估算。
+  // Sync tier→backend chains so backend IDs and custom pricing feed route() cost estimates.
   const tiers = routing?.tiers;
   if (tiers) {
     for (const tier of VALID_TIERS) {
@@ -127,7 +127,7 @@ function buildRoutingConfigFromRaw(routing?: RawRouterConfig["routing"]): Routin
   return config;
 }
 
-/** 合并 BLOCKRUN_MODELS 默认定价与 backends 自定义定价。 */
+/** Merge BLOCKRUN_MODELS default pricing with per-backend overrides. */
 function buildModelPricing(backends: Record<string, BackendConfig>): Map<string, { inputPrice: number; outputPrice: number }> {
   const modelPricing = new Map(
     BLOCKRUN_MODELS.map((model) => [
@@ -146,7 +146,7 @@ function buildModelPricing(backends: Record<string, BackendConfig>): Map<string,
   return modelPricing;
 }
 
-/** 无 router.config.json 时，从 VLLM_* 环境变量合成等价配置。 */
+/** Build an equivalent config from VLLM_* env vars when router.config.json is missing. */
 function buildConfigFromEnv(): RawRouterConfig {
   const defBase = (process.env.VLLM_DEFAULT_BASE ?? "").replace(/\/$/, "");
   const defModel = process.env.VLLM_DEFAULT_MODEL ?? "default";
@@ -182,7 +182,7 @@ function buildConfigFromEnv(): RawRouterConfig {
 function readConfigFile(filePath: string): RawRouterConfig {
   const fullPath = resolve(process.cwd(), filePath);
   if (!existsSync(fullPath)) {
-    throw new Error(`配置文件不存在: ${fullPath}`);
+    throw new Error(`Config file not found: ${fullPath}`);
   }
   return JSON.parse(readFileSync(fullPath, "utf-8")) as RawRouterConfig;
 }
@@ -218,7 +218,7 @@ export function getRouterConfigState(): RouterConfigState {
   return state;
 }
 
-/** 热重载：重新读取配置文件或环境变量快照。 */
+/** Hot reload: re-read config file or env snapshot. */
 export function reloadRouterConfig(): RouterConfigState {
   state = loadRouterConfig();
   return state;
@@ -240,7 +240,7 @@ export function getTierBackendConfig(tier: Tier): TierBackendConfig | null {
   return state.raw.routing?.tiers?.[tier] ?? null;
 }
 
-/** 若档位在配置中有定义则保留，否则回退到 policy.defaultTier。 */
+/** Keep tier when configured; otherwise fall back to policy.defaultTier. */
 export function normalizeTier(tier: unknown): Tier {
   if (isTier(tier) && getTierBackendConfig(tier)) return tier;
   return getPolicy().defaultTier;
@@ -248,16 +248,16 @@ export function normalizeTier(tier: unknown): Tier {
 
 export function getBackend(id: string): BackendConfig {
   const backend = state.raw.backends?.[id];
-  if (!backend) throw new Error(`配置中未找到后端: ${id}`);
+  if (!backend) throw new Error(`Backend not found in config: ${id}`);
   return backend;
 }
 
-/** 返回 router.config 中全部已配置后端（只读快照）。 */
+/** Read-only snapshot of all configured backends. */
 export function getConfiguredBackends(): Record<string, BackendConfig> {
   return state.raw.backends ?? {};
 }
 
-/** 健康探测用鉴权头（与 example-router 一致：无 key 时发 Bearer EMPTY）。 */
+/** Auth header for health probes (matches example-router: Bearer EMPTY when no key). */
 export function authorizationHeaderForProbe(backend: BackendConfig): Record<string, string> {
   const key = backend.apiKey?.trim();
   if (key && key !== "EMPTY") {
@@ -267,7 +267,7 @@ export function authorizationHeaderForProbe(backend: BackendConfig): Record<stri
   return { Authorization: "Bearer EMPTY" };
 }
 
-/** OpenAI 兼容模型列表：每个 backend 映射为 local-router/{backendId}。 */
+/** OpenAI-compatible model list: each backend maps to local-router/{backendId}. */
 export function listGatewayModels(): Array<{
   id: string;
   object: "model";
@@ -294,7 +294,7 @@ export type BackendHealthCheck = {
   error?: string;
 };
 
-/** 对每个 backend 请求 GET /models，探测上游连通性。 */
+/** Probe each backend with GET /models to check upstream connectivity. */
 export async function probeAllBackends(): Promise<BackendHealthCheck[]> {
   return Promise.all(
     Object.entries(getConfiguredBackends()).map(async ([backendId, backend]) => {
@@ -324,12 +324,12 @@ export async function probeAllBackends(): Promise<BackendHealthCheck[]> {
   );
 }
 
-/** 按 tier 解析 primary + fallback 链，受 maxFallbackAttempts 限制。 */
+/** Resolve primary + fallback chain for a tier, capped by maxFallbackAttempts. */
 export function resolveBackendIdsForTier(tier: Tier): string[] {
   const { maxFallbackAttempts } = getPolicy();
   const tierConfig = getTierBackendConfig(tier);
   if (!tierConfig?.primary) {
-    throw new Error(`缺少 routing.tiers.${tier}.primary 配置`);
+    throw new Error(`Missing routing.tiers.${tier}.primary in config`);
   }
   return [tierConfig.primary, ...(tierConfig.fallback ?? [])]
     .filter(Boolean)
@@ -349,7 +349,7 @@ function deleteByPath(obj: Record<string, unknown>, dottedPath: string): void {
   }
 }
 
-/** 合并后端 requestParams 并覆写 model，支持 removeParams 删除字段。 */
+/** Merge backend requestParams, override model, and apply removeParams deletions. */
 export function buildUpstreamBody(
   backend: BackendConfig,
   body: Record<string, unknown>,
@@ -368,7 +368,7 @@ export function buildUpstreamBody(
   return { ...upstreamBody, model: backend.model };
 }
 
-/** 优先使用后端 apiKey；SIMPLE 档可在未配置时沿用请求 Authorization。 */
+/** Prefer backend apiKey; SIMPLE tier may reuse request Authorization when unset. */
 export function authorizationForBackend(
   backend: BackendConfig,
   req: IncomingMessage,
