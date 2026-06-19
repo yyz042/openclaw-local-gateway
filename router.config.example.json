@@ -1,0 +1,55 @@
+{
+  "policy": {
+    "defaultTier": "MEDIUM",
+    "maxFallbackAttempts": 3,
+    "retryStatuses": [400, 401, 402, 403, 429, 500, 502, 503, 504]
+  },
+  "routing": {
+    "tiers": {
+      "SIMPLE": {
+        "primary": "groq_qwen3_32b",
+        "fallback": []
+      },
+      "MEDIUM": {
+        "primary": "default_upstream",
+        "fallback": ["groq_qwen3_32b"]
+      },
+      "COMPLEX": {
+        "primary": "default_upstream",
+        "fallback": ["groq_qwen3_32b"]
+      },
+      "REASONING": {
+        "primary": "default_upstream",
+        "fallback": ["groq_qwen3_32b"]
+      }
+    },
+    "scoring": {
+      "reasoningKeywords": ["prove", "theorem", "formal", "derive", "证明", "定理"],
+      "codeKeywords": ["function", "class", "async", "import", "函数", "类"],
+      "simpleKeywords": ["what is", "define", "hello", "你好", "天气"]
+    },
+    "classifier": {
+      "confidenceThreshold": 0.55
+    },
+    "overrides": {
+      "largeContextTokens": 128000,
+      "structuredOutput": true
+    }
+  },
+  "backends": {
+    "groq_qwen3_32b": {
+      "baseUrl": "https://api.groq.com/openai/v1",
+      "model": "qwen/qwen3-32b",
+      "apiKey": "",
+      "inputPrice": 0.1,
+      "outputPrice": 0.3
+    },
+    "default_upstream": {
+      "baseUrl": "https://api.us-west-2.modal.direct/v1",
+      "model": "zai-org/GLM-5.1-FP8",
+      "apiKey": "",
+      "inputPrice": 0.6,
+      "outputPrice": 1.8
+    }
+  }
+}
