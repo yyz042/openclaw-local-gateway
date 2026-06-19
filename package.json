@@ -1,0 +1,21 @@
+{
+  "name": "openclaw-local-gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Standalone local gateway for OpenClaw with built-in tier routing.",
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "start": "node --import tsx src/server.ts",
+    "start:env": "node --import tsx --env-file=.env src/server.ts",
+    "test:vllm-simple": "node --import tsx --env-file=.env scripts/test-vllm-simple-connectivity.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^22.15.2",
+    "tsx": "^4.21.0",
+    "typescript": "^5.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
